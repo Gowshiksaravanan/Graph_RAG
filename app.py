@@ -2,12 +2,14 @@ import io
 import re
 
 import streamlit as st
+import streamlit.components.v1 as components
 import tiktoken
 from pypdf import PdfReader
 from docx import Document
 from openai import OpenAI
 from rdflib import Graph, RDF, OWL
 from poml import poml
+from pyvis.network import Network
 from loguru import logger
 
 from config import (
@@ -534,9 +536,138 @@ def main():
                     kg_status,
                 )
 
+    # ── Graph Visualization ──
+    st.divider()
+    run_graph_visualization()
+
     # ── Step 3: Ask Questions ──
     st.divider()
     run_chat_section(gen_model)
+
+
+COLOR_PALETTE = [
+    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
+    "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
+    "#86bcb6", "#8cd17d", "#a0cbe8", "#d4a6c8", "#ffbe7d",
+    "#d7b5a6", "#b6992d", "#ff6b6b", "#4ecdc4", "#45b7d1",
+]
+
+
+def run_graph_visualization():
+    st.header("Graph Visualization")
+
+    try:
+        neo4j_client = Neo4jClient()
+        driver = neo4j_client()
+        domains = get_existing_domains(driver)
+    except Exception:
+        st.warning("Could not connect to Neo4j.")
+        return
+
+    if not domains:
+        st.info("No graph to visualize. Build a Knowledge Graph first.")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        viz_domain = st.selectbox("Domain", options=sorted(domains), key="viz_domain")
+    with col2:
+        node_limit = st.slider("Max nodes", min_value=20, max_value=500, value=100, step=20, key="viz_limit")
+
+    if st.button("Visualize Graph"):
+        with st.spinner("Loading graph..."):
+            try:
+                html, legend = build_graph_html(driver, viz_domain, node_limit)
+                if legend:
+                    cols = st.columns(min(len(legend), 6))
+                    for i, (label, color) in enumerate(legend.items()):
+                        cols[i % len(cols)].markdown(
+                            f'<span style="color:{color}; font-size:20px;">&#9679;</span> {label}',
+                            unsafe_allow_html=True,
+                        )
+                components.html(html, height=700, scrolling=False)
+            except Exception as e:
+                st.error(f"Visualization error: {e}")
+
+    neo4j_client.close()
+
+
+def build_graph_html(driver, domain: str, limit: int) -> tuple[str, dict]:
+    node_query = """
+    MATCH (n)
+    WHERE n.domain = $domain AND n.name IS NOT NULL
+      AND NONE(lbl IN labels(n) WHERE lbl IN ['Document', 'Chunk'])
+    RETURN elementId(n) AS id, n.name AS name, labels(n) AS labels
+    LIMIT $limit
+    """
+    rel_query = """
+    MATCH (a)-[r]->(b)
+    WHERE a.domain = $domain AND b.domain = $domain
+      AND a.name IS NOT NULL AND b.name IS NOT NULL
+      AND NONE(lbl IN labels(a) WHERE lbl IN ['Document', 'Chunk'])
+      AND NONE(lbl IN labels(b) WHERE lbl IN ['Document', 'Chunk'])
+      AND NOT type(r) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK']
+    WITH a, r, b LIMIT $limit
+    RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS rel_type
+    """
+
+    with driver.session() as session:
+        nodes = session.run(node_query, domain=domain, limit=limit).data()
+        rels = session.run(rel_query, domain=domain, limit=limit * 3).data()
+
+    # Count connections per node for sizing
+    degree: dict[str, int] = {}
+    for rel in rels:
+        degree[rel["source"]] = degree.get(rel["source"], 0) + 1
+        degree[rel["target"]] = degree.get(rel["target"], 0) + 1
+
+    # Auto-assign colors to entity types
+    all_types = set()
+    for node in nodes:
+        for lbl in node["labels"]:
+            if lbl not in ("__Entity__", "Document", "Chunk"):
+                all_types.add(lbl)
+    type_colors = {}
+    for i, t in enumerate(sorted(all_types)):
+        type_colors[t] = COLOR_PALETTE[i % len(COLOR_PALETTE)]
+
+    net = Network(height="680px", width="100%", bgcolor="#0e1117", font_color="#ffffff")
+    net.barnes_hut(gravity=-5000, central_gravity=0.35, spring_length=200, spring_strength=0.01)
+
+    node_ids = set()
+    for node in nodes:
+        nid = node["id"]
+        node_ids.add(nid)
+        name = node["name"]
+        node_labels = [l for l in node["labels"] if l not in ("__Entity__",)]
+        entity_type = node_labels[0] if node_labels else "Unknown"
+        color = type_colors.get(entity_type, "#aaaaaa")
+        size = 12 + min(degree.get(nid, 0) * 4, 40)
+        short_name = name if len(name) <= 25 else name[:22] + "..."
+
+        net.add_node(
+            nid,
+            label=short_name,
+            title=f"<b>{entity_type}</b><br>{name}<br>Connections: {degree.get(nid, 0)}",
+            color=color,
+            size=size,
+            font={"size": 11, "color": "#ffffff", "strokeWidth": 2, "strokeColor": "#000000"},
+        )
+
+    for rel in rels:
+        if rel["source"] in node_ids and rel["target"] in node_ids:
+            net.add_edge(
+                rel["source"],
+                rel["target"],
+                title=rel["rel_type"],
+                label=rel["rel_type"],
+                color={"color": "#555555", "highlight": "#ffffff"},
+                font={"size": 8, "color": "#aaaaaa", "strokeWidth": 0},
+                arrows="to",
+                width=1.5,
+            )
+
+    return net.generate_html(), type_colors
 
 
 def run_chat_section(gen_model: str):
