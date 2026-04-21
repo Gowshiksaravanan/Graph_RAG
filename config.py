@@ -5,10 +5,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-NEO4J_URI = os.getenv("NEO4J_URI", "")
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
+
+def _get_secret(key: str) -> str:
+    val = os.getenv(key, "")
+    if not val:
+        try:
+            import streamlit as st
+            val = st.secrets.get(key, "")
+        except Exception:
+            pass
+    return val
+
+
+OPENAI_API_KEY = _get_secret("OPENAI_API_KEY")
+NEO4J_URI = _get_secret("NEO4J_URI")
+NEO4J_USERNAME = _get_secret("NEO4J_USERNAME")
+NEO4J_PASSWORD = _get_secret("NEO4J_PASSWORD")
 
 PROJECT_DIR = Path(__file__).parent
 PROMPTS_DIR = PROJECT_DIR / "prompts"
