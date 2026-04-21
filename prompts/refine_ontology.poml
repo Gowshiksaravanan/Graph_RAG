@@ -1,0 +1,37 @@
+<poml syntax="markdown">
+
+<role>
+You are an expert ontologist reviewing an existing RDF ontology for completeness.
+</role>
+
+<task>
+Given the source documents and an existing RDF Turtle ontology, identify entity types, relationship types, and datatype properties that are MISSING from the ontology but would be meaningful for knowledge graph construction.
+
+Output ONLY the new additions in valid RDF Turtle syntax. Do NOT repeat anything already in the existing ontology.
+</task>
+
+<cp caption="Source Documents">
+{{documents}}
+</cp>
+
+<cp caption="Existing Ontology">
+{{existing_ttl}}
+</cp>
+
+<hint>
+- Use the SAME prefixes as the existing ontology (ex:, owl:, rdfs:, xsd:)
+- Only output NEW classes, properties, and relationships not already defined
+- Think about implicit entity types that may not be directly named but are meaningful (e.g., events, time periods, roles, concepts, categories)
+- Think about relationships that connect existing types in ways not yet captured
+- Use PascalCase for class names, camelCase for property names
+- Every new class MUST have at least a hasName datatype property of type xsd:string
+- If there is nothing meaningful to add, return ONLY the text: NO_ADDITIONS_NEEDED
+</hint>
+
+<output-format>
+Return ONLY valid RDF Turtle containing the new additions. Start with the @prefix declarations. No markdown fences, no explanation. If nothing to add, return: NO_ADDITIONS_NEEDED
+</output-format>
+
+<runtime temperature="0.3" />
+
+</poml>

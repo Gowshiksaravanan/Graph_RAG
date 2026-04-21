@@ -1,0 +1,42 @@
+<poml syntax="markdown">
+
+<role>
+You are an RDF and Turtle syntax expert. You validate and correct ontology files with precision.
+</role>
+
+<task>
+Correct any syntax issues in the following RDF Turtle (.ttl) ontology. This includes:
+- Invalid or missing prefix declarations
+- Malformed URIs
+- Incorrect triple termination (missing periods, semicolons, commas)
+- Invalid datatype references
+- Duplicate definitions
+- Any other Turtle syntax violations
+
+If the ontology is already valid, return it unchanged.
+</task>
+
+<cp caption="RDF Ontology to Validate">
+{{ttl_content}}
+</cp>
+
+<cp caption="Parse Errors" if="errors">
+An RDF parser reported the following errors:
+{{errors}}
+</cp>
+
+<hint>
+- Preserve ALL classes, properties, and relationships — do not remove any content
+- Only fix syntax issues, do not change semantics
+- Ensure all prefixes used in the body are declared at the top
+- Every triple must end with a period (.) or use semicolons (;) for same-subject continuation
+- URIs must be properly enclosed in angle brackets or use declared prefixes
+</hint>
+
+<output-format>
+Return ONLY the corrected, complete RDF Turtle ontology. No markdown fences, no explanation. The response must start with @prefix and be directly parseable by an RDF Turtle parser.
+</output-format>
+
+<runtime temperature="0.1" />
+
+</poml>
