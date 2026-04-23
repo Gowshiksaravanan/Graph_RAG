@@ -30,6 +30,7 @@ from graph import (
     build_knowledge_graph,
     query_graph_rag,
 )
+from baseline_rag import build_baseline_index, query_baseline_rag
 
 ENCODING = tiktoken.get_encoding(TIKTOKEN_ENCODING)
 
@@ -540,6 +541,10 @@ def main():
     st.divider()
     run_graph_visualization()
 
+    # ── Conventional RAG Baseline ──
+    st.divider()
+    run_conventional_rag_section(gen_model, uploaded_files)
+
     # ── Step 3: Ask Questions ──
     st.divider()
     run_chat_section(gen_model)
@@ -727,6 +732,106 @@ def run_chat_section(gen_model: str):
                     error_msg = f"Error querying graph: {e}"
                     st.error(error_msg)
                     st.session_state["chat_history"].append({"role": "assistant", "content": error_msg})
+
+
+def run_conventional_rag_section(gen_model: str, uploaded_files):
+    st.header("Conventional RAG Baseline (Vector-Only)")
+    st.caption("This section is a non-graph baseline for side-by-side comparison against GraphRAG.")
+
+    if not OPENAI_API_KEY:
+        st.warning("OPENAI_API_KEY is required for baseline embeddings and answering.")
+        return
+
+    if not uploaded_files:
+        st.info("Upload documents above to build a conventional RAG baseline index.")
+        return
+
+    with st.expander("Baseline configuration", expanded=False):
+        baseline_top_k = st.slider("Top-K retrieval", min_value=2, max_value=10, value=5, key="baseline_top_k")
+        chunk_tokens = st.slider("Chunk token limit", min_value=150, max_value=800, value=400, step=50, key="baseline_chunk_tokens")
+        embedding_model = st.selectbox(
+            "Embedding model",
+            options=["text-embedding-3-small", "text-embedding-3-large"],
+            index=0,
+            key="baseline_embedding_model",
+        )
+
+    if st.button("Build Conventional RAG Index", key="baseline_build", type="secondary"):
+        docs: list[dict] = []
+        for file in uploaded_files:
+            text = extract_text(file)
+            if text.strip():
+                docs.append({"name": file.name, "text": text})
+
+        if not docs:
+            st.error("No text could be extracted from uploaded files for baseline indexing.")
+            return
+
+        with st.spinner("Building vector index for baseline RAG..."):
+            try:
+                index = build_baseline_index(
+                    docs=docs,
+                    api_key=OPENAI_API_KEY,
+                    embedding_model=embedding_model,
+                    chunk_token_limit=chunk_tokens,
+                )
+                st.session_state["baseline_index"] = index
+                st.session_state["baseline_docs"] = docs
+                st.success(f"Baseline index ready: {len(index['chunks'])} chunks from {len(docs)} documents.")
+            except Exception as e:
+                st.error(f"Could not build baseline index: {e}")
+                return
+
+    baseline_index = st.session_state.get("baseline_index")
+    if not baseline_index:
+        return
+
+    st.info(
+        f"Active baseline index: {len(baseline_index['chunks'])} chunks | "
+        f"Embedding model: {baseline_index['embedding_model']}"
+    )
+
+    if "baseline_chat_history" not in st.session_state:
+        st.session_state["baseline_chat_history"] = []
+
+    for msg in st.session_state["baseline_chat_history"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    baseline_question = st.chat_input("Ask the baseline RAG...", key="baseline_chat_input")
+    if not baseline_question:
+        return
+
+    st.session_state["baseline_chat_history"].append({"role": "user", "content": baseline_question})
+    with st.chat_message("user"):
+        st.markdown(baseline_question)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Retrieving baseline context..."):
+            try:
+                result = query_baseline_rag(
+                    index=baseline_index,
+                    question=baseline_question,
+                    api_key=OPENAI_API_KEY,
+                    answer_model=gen_model,
+                    top_k=baseline_top_k,
+                )
+                answer = result["answer"]
+                st.markdown(answer)
+                st.session_state["baseline_chat_history"].append({"role": "assistant", "content": answer})
+
+                with st.expander("Baseline retrieved chunks"):
+                    for item in result["retrieved"]:
+                        st.markdown(
+                            f"**[{item['rank']}]** {item['source']} | "
+                            f"score={item['score']:.4f} | {item['chunk_id']}"
+                        )
+                        st.text(item["text"][:600])
+                        st.divider()
+            except Exception as e:
+                error_msg = f"Baseline query error: {e}"
+                st.error(error_msg)
+                st.session_state["baseline_chat_history"].append({"role": "assistant", "content": error_msg})
 
 
 if __name__ == "__main__":
