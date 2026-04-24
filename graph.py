@@ -134,69 +134,55 @@ def ontology_to_schema(ttl_string: str) -> GraphSchema:
 
 
 # ---------------------------------------------------------------------------
-# Entity overlap check
+# Graph stats & duplicate detection
 # ---------------------------------------------------------------------------
-def check_entity_overlap(driver: Driver, entity_names: list[str]) -> dict:
+def get_graph_stats(driver: Driver) -> dict:
+    with driver.session() as session:
+        entities = session.run(
+            "MATCH (n) WHERE n.name IS NOT NULL "
+            "AND NONE(lbl IN labels(n) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk']) "
+            "RETURN count(n) AS cnt"
+        ).single()["cnt"]
+
+        rels = session.run(
+            "MATCH ()-[r]->() "
+            "WHERE NOT type(r) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO'] "
+            "RETURN count(r) AS cnt"
+        ).single()["cnt"]
+
+    return {"entities": entities, "relationships": rels}
+
+
+def find_duplicate_entities(driver: Driver) -> list[dict]:
     query = """
-    UNWIND $names AS name
-    OPTIONAL MATCH (n)
-    WHERE toLower(n.name) = toLower(name)
-    WITH name, collect(DISTINCT n.domain) AS domains, count(n) AS matches
-    WHERE matches > 0
-    RETURN name, domains, matches
+    MATCH (a), (b)
+    WHERE a.name IS NOT NULL AND b.name IS NOT NULL
+      AND NONE(lbl IN labels(a) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
+      AND NONE(lbl IN labels(b) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
+      AND toLower(trim(a.name)) = toLower(trim(b.name))
+      AND elementId(a) < elementId(b)
+    WITH a, b,
+         [lbl IN labels(a) WHERE lbl <> '__Entity__'][0] AS label_a,
+         [lbl IN labels(b) WHERE lbl <> '__Entity__'][0] AS label_b
+    RETURN a.name AS name,
+           label_a,
+           label_b,
+           CASE WHEN label_a = label_b THEN 'same_label' ELSE 'cross_label' END AS match_type,
+           elementId(a) AS id_a,
+           elementId(b) AS id_b
     """
     with driver.session() as session:
-        result = session.run(query, names=entity_names)
-        matched = []
-        domain_counts: dict[str, int] = {}
-        for record in result:
-            matched.append({
-                "name": record["name"],
-                "domains": [d for d in record["domains"] if d is not None],
-                "matches": record["matches"],
-            })
-            for d in record["domains"]:
-                if d is not None:
-                    domain_counts[d] = domain_counts.get(d, 0) + 1
-
-    total = len(entity_names) if entity_names else 1
-    overlap_pct = (len(matched) / total) * 100
-
-    return {
-        "matched_entities": matched,
-        "overlap_pct": overlap_pct,
-        "domain_counts": domain_counts,
-        "total_extracted": len(entity_names),
-        "total_matched": len(matched),
-    }
+        return session.run(query).data()
 
 
-# ---------------------------------------------------------------------------
-# Domain tagging
-# ---------------------------------------------------------------------------
-def tag_new_nodes_with_domain(driver: Driver, domain: str):
-    query = """
-    MATCH (n)
-    WHERE n.domain IS NULL
-    SET n.domain = $domain
-    RETURN count(n) AS tagged
-    """
+def has_any_entities(driver: Driver) -> bool:
     with driver.session() as session:
-        result = session.run(query, domain=domain)
-        count = result.single()["tagged"]
-        logger.info(f"Tagged {count} nodes with domain '{domain}'")
-        return count
-
-
-def get_existing_domains(driver: Driver) -> list[str]:
-    query = """
-    MATCH (n)
-    WHERE n.domain IS NOT NULL
-    RETURN DISTINCT n.domain AS domain
-    """
-    with driver.session() as session:
-        result = session.run(query)
-        return [record["domain"] for record in result]
+        result = session.run(
+            "MATCH (n) WHERE n.name IS NOT NULL "
+            "AND NONE(lbl IN labels(n) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk']) "
+            "RETURN count(n) > 0 AS has"
+        ).single()
+        return result["has"]
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +227,47 @@ def build_knowledge_graph(
 
 
 # ---------------------------------------------------------------------------
+# Edge weight computation (shared-chunk frequency, normalized)
+# ---------------------------------------------------------------------------
+def compute_edge_weights(driver: Driver, alpha: float = 0.1) -> dict:
+    count_query = """
+    MATCH (a)-[r]->(b)
+    WHERE NOT type(r) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO']
+      AND a.name IS NOT NULL AND b.name IS NOT NULL
+      AND NONE(lbl IN labels(a) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
+      AND NONE(lbl IN labels(b) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
+    OPTIONAL MATCH (a)-[:FROM_CHUNK]->(c:Chunk)<-[:FROM_CHUNK]-(b)
+    WITH r, elementId(a) AS aid, elementId(b) AS bid, type(r) AS rel_type,
+         count(DISTINCT c) AS shared_chunks
+    RETURN elementId(r) AS rel_id, aid, bid, rel_type, shared_chunks
+    """
+
+    with driver.session() as session:
+        rows = session.run(count_query).data()
+
+    if not rows:
+        return {"updated": 0, "max_shared": 0}
+
+    max_shared = max(r["shared_chunks"] for r in rows)
+    if max_shared == 0:
+        max_shared = 1
+
+    updated = 0
+    with driver.session() as session:
+        for row in rows:
+            normalized = row["shared_chunks"] / max_shared
+            weight = round(alpha + (1 - alpha) * normalized, 4)
+            session.run(
+                "MATCH ()-[r]->() WHERE elementId(r) = $rid SET r.weight = $w",
+                rid=row["rel_id"], w=weight,
+            )
+            updated += 1
+
+    logger.info(f"Edge weights computed: {updated} relationships, max shared chunks: {max_shared}, alpha: {alpha}")
+    return {"updated": updated, "max_shared": max_shared}
+
+
+# ---------------------------------------------------------------------------
 # Vector index & GraphRAG retrieval
 # ---------------------------------------------------------------------------
 def ensure_vector_index(driver: Driver):
@@ -262,28 +289,81 @@ def query_graph_rag(
     driver: Driver,
     question: str,
     model: str,
-    domain: str | None = None,
+    hops: int = 2,
+    weight_threshold: float = 0.2,
+    include_web_sources: bool = False,
+    web_similarity_threshold: float = 0.5,
 ) -> dict:
     ensure_vector_index(driver)
 
-    if domain:
+    wt = weight_threshold
+    ws = web_similarity_threshold
+
+    web_clause = ""
+    web_with = ""
+    web_return = ""
+    if include_web_sources:
+        web_clause = (
+            "OPTIONAL MATCH (node)-[sim:SIMILAR_TO]->(wc:WebChunk) "
+            f"WHERE sim.weight >= {ws} "
+        )
+        web_with = (
+            ", collect(DISTINCT CASE WHEN wc IS NOT NULL "
+            "THEN '[[WEB sim:' + toString(sim.weight) + ']] ' + coalesce(wc.text, '') "
+            "ELSE NULL END) AS web_context"
+        )
+        web_return = ", web_context"
+
+    if hops >= 2:
         retrieval_query = (
             "WITH node, score "
             "OPTIONAL MATCH (entity)-[:FROM_CHUNK]->(node) "
-            "WHERE entity.domain = $domain "
-            "OPTIONAL MATCH (entity)-[r]->(neighbor) "
-            "WHERE NOT type(r) = 'FROM_CHUNK' "
+
+            "OPTIONAL MATCH (entity)-[r1]->(hop1) "
+            "WHERE NOT type(r1) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO'] "
+            f"AND coalesce(r1.weight, 1.0) >= {wt} "
+
+            "OPTIONAL MATCH (hop1)-[r2]->(hop2) "
+            "WHERE NOT type(r2) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO'] "
+            f"AND coalesce(r2.weight, 1.0) >= {wt} "
+            "AND hop2 <> entity "
+
+            + web_clause +
+
+            "WITH node, score, entity, "
+            "collect(DISTINCT coalesce(entity.name, '') + ' -[' + type(r1) "
+            "+ ' w:' + toString(coalesce(r1.weight, 1.0)) + ']-> ' "
+            "+ coalesce(hop1.name, '')) AS hop1_rels, "
+
+            "collect(DISTINCT coalesce(hop1.name, '') + ' -[' + type(r2) "
+            "+ ' w:' + toString(round(coalesce(r1.weight, 1.0) * coalesce(r2.weight, 1.0) * 1000) / 1000) "
+            "+ ']-> ' + coalesce(hop2.name, '')) AS hop2_rels"
+
+            + web_with + " "
+
             "RETURN node.text AS text, score, "
-            "collect(DISTINCT coalesce(entity.name, '') + ' -[' + type(r) + ']-> ' + coalesce(neighbor.name, '')) AS relationships"
+            "hop1_rels + hop2_rels AS relationships"
+            + web_return
         )
     else:
         retrieval_query = (
             "WITH node, score "
             "OPTIONAL MATCH (entity)-[:FROM_CHUNK]->(node) "
             "OPTIONAL MATCH (entity)-[r]->(neighbor) "
-            "WHERE NOT type(r) = 'FROM_CHUNK' "
-            "RETURN node.text AS text, score, "
-            "collect(DISTINCT coalesce(entity.name, '') + ' -[' + type(r) + ']-> ' + coalesce(neighbor.name, '')) AS relationships"
+            "WHERE NOT type(r) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO'] "
+            f"AND coalesce(r.weight, 1.0) >= {wt} "
+
+            + web_clause +
+
+            "WITH node, score, "
+            "collect(DISTINCT coalesce(entity.name, '') + ' -[' + type(r) "
+            "+ ' w:' + toString(coalesce(r.weight, 1.0)) + ']-> ' "
+            "+ coalesce(neighbor.name, '')) AS relationships"
+
+            + web_with + " "
+
+            "RETURN node.text AS text, score, relationships"
+            + web_return
         )
 
     embedder = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
@@ -303,13 +383,9 @@ def query_graph_rag(
 
     rag = GraphRAG(retriever=retriever, llm=llm)
 
-    retriever_config = {"top_k": 5}
-    if domain:
-        retriever_config["query_params"] = {"domain": domain}
-
     result = rag.search(
         query_text=question,
-        retriever_config=retriever_config,
+        retriever_config={"top_k": 5},
         return_context=True,
     )
 

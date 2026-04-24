@@ -24,11 +24,30 @@ from config import (
 from graph import (
     Neo4jClient,
     ontology_to_schema,
-    check_entity_overlap,
-    tag_new_nodes_with_domain,
-    get_existing_domains,
     build_knowledge_graph,
     query_graph_rag,
+    get_graph_stats,
+    find_duplicate_entities,
+    has_any_entities,
+    compute_edge_weights,
+)
+from entity_resolution import (
+    find_candidate_pairs,
+    score_exact,
+    score_embedding_batch,
+    score_llm_batch,
+    build_transitive_clusters,
+    merge_cluster,
+    undo_merge,
+    find_orphaned_nodes,
+)
+from web_sources import (
+    extract_topics,
+    search_and_fetch,
+    build_web_knowledge_graph,
+    compute_similar_to_edges,
+    remove_web_content,
+    get_web_source_stats,
 )
 
 ENCODING = tiktoken.get_encoding(TIKTOKEN_ENCODING)
@@ -370,7 +389,7 @@ def get_ontology_stats(ttl_string: str) -> dict:
 # ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
-def run_kg_pipeline(docs, ttl_string, gen_model, overlap_threshold, domain_name, status):
+def run_kg_pipeline(docs, ttl_string, gen_model, status, alpha=0.1):
     try:
         neo4j_client = Neo4jClient()
         driver = neo4j_client()
@@ -379,6 +398,9 @@ def run_kg_pipeline(docs, ttl_string, gen_model, overlap_threshold, domain_name,
         return
 
     try:
+        # ── Snapshot before build ──
+        stats_before = get_graph_stats(driver)
+
         # ── Convert ontology to schema ──
         status.update(label="Converting ontology to schema...")
         schema = ontology_to_schema(ttl_string)
@@ -388,7 +410,7 @@ def run_kg_pipeline(docs, ttl_string, gen_model, overlap_threshold, domain_name,
             f"**{len(schema.patterns)}** patterns"
         )
 
-        # ── Build KG (SimpleKGPipeline writes untagged nodes) ──
+        # ── Build KG ──
         status.update(label=f"Building Knowledge Graph ({gen_model})...")
         progress = st.progress(0, text="Processing documents...")
 
@@ -398,45 +420,28 @@ def run_kg_pipeline(docs, ttl_string, gen_model, overlap_threshold, domain_name,
         build_knowledge_graph(driver, schema, docs, gen_model, on_complete=on_doc_complete)
         st.success("Entity extraction and KG construction complete.")
 
-        # ── Overlap check on untagged nodes ──
-        status.update(label="Checking entity overlap...")
-        untagged_query = "MATCH (n) WHERE n.domain IS NULL RETURN collect(DISTINCT n.name) AS names"
-        with driver.session() as session:
-            result = session.run(untagged_query)
-            new_entity_names = result.single()["names"]
-            new_entity_names = [n for n in new_entity_names if n is not None]
+        # ── Compute edge weights ──
+        status.update(label="Computing edge weights...")
+        weight_stats = compute_edge_weights(driver, alpha=alpha)
+        st.success(f"Edge weights computed: **{weight_stats['updated']}** relationships (max shared chunks: {weight_stats['max_shared']}, α={alpha})")
 
-        if not new_entity_names:
-            st.warning("No new entities were extracted.")
-            status.update(label="Done!", state="complete")
-            return
+        # ── Snapshot after build ──
+        stats_after = get_graph_stats(driver)
+        new_entities = stats_after["entities"] - stats_before["entities"]
+        new_rels = stats_after["relationships"] - stats_before["relationships"]
 
-        st.info(f"Extracted **{len(new_entity_names)}** new entities.")
+        # ── Detect duplicates ──
+        status.update(label="Detecting duplicate entities...")
+        duplicates = find_duplicate_entities(driver)
 
-        existing_domains = get_existing_domains(driver)
-
-        if existing_domains:
-            overlap = check_entity_overlap(driver, new_entity_names)
-            st.write(f"**Overlap: {overlap['overlap_pct']:.1f}%** ({overlap['total_matched']}/{overlap['total_extracted']} entities match existing nodes)")
-
-            if overlap["domain_counts"]:
-                st.write("**Matches by domain:**")
-                for domain, count in sorted(overlap["domain_counts"].items(), key=lambda x: -x[1]):
-                    st.write(f"  - `{domain}`: {count} matches")
-
-            if overlap["overlap_pct"] >= overlap_threshold:
-                best_domain = max(overlap["domain_counts"], key=overlap["domain_counts"].get)
-                st.info(f"Overlap ({overlap['overlap_pct']:.1f}%) >= threshold ({overlap_threshold}%). Merging into domain: **{best_domain}**")
-                tagged = tag_new_nodes_with_domain(driver, best_domain)
-                st.success(f"Tagged {tagged} new nodes with domain '{best_domain}'.")
-            else:
-                st.info(f"Overlap ({overlap['overlap_pct']:.1f}%) < threshold ({overlap_threshold}%). Creating new domain: **{domain_name}**")
-                tagged = tag_new_nodes_with_domain(driver, domain_name)
-                st.success(f"Tagged {tagged} new nodes with domain '{domain_name}'.")
-        else:
-            st.info(f"No existing domains. Creating new domain: **{domain_name}**")
-            tagged = tag_new_nodes_with_domain(driver, domain_name)
-            st.success(f"Tagged {tagged} nodes with domain '{domain_name}'.")
+        # ── Store results for dashboard ──
+        st.session_state["kg_stats"] = {
+            "before": stats_before,
+            "after": stats_after,
+            "new_entities": new_entities,
+            "new_relationships": new_rels,
+            "duplicates": duplicates,
+        }
 
         status.update(label="Done!", state="complete")
 
@@ -462,14 +467,10 @@ def main():
         budget = KNOWN_MODEL_LIMITS[gen_model]["doc_budget"]
         st.metric("Document Budget", f"{budget:,} tokens")
         st.divider()
-        st.header("Knowledge Graph")
-        overlap_threshold = st.slider(
-            "Overlap Threshold (%)", min_value=0, max_value=100, value=30,
-            help="If entity overlap >= this threshold, merge into existing domain",
-        )
-        domain_name = st.text_input(
-            "New Domain Name", value="",
-            help="Name for this domain if a new one is created (e.g., 'harry_potter', 'aerospace')",
+        alpha = st.slider("Edge Weight Floor (α)", min_value=0.0, max_value=0.5, value=0.1, step=0.05,
+                          help="Minimum weight for any relationship. Higher = less contrast between weak and strong edges.")
+        st.divider()
+        st.header("Knowledge Graph"
         )
 
     # ── File uploader ──
@@ -526,15 +527,46 @@ def main():
         # ── Step 2: Build Knowledge Graph ──
         st.header("Step 2: Build Knowledge Graph")
 
-        if not domain_name.strip():
-            st.warning("Please enter a **New Domain Name** in the sidebar before building the KG.")
-        elif st.button("Build Knowledge Graph", type="primary"):
+        if st.button("Build Knowledge Graph", type="primary"):
             with st.status("Building Knowledge Graph...", expanded=True) as kg_status:
-                run_kg_pipeline(
-                    docs, ttl_result, gen_model,
-                    overlap_threshold, domain_name.strip().lower().replace(" ", "_"),
-                    kg_status,
-                )
+                run_kg_pipeline(docs, ttl_result, gen_model, kg_status, alpha=alpha)
+
+    # ── Overlap Dashboard ──
+    kg_stats = st.session_state.get("kg_stats")
+    if kg_stats:
+        st.divider()
+        st.header("Overlap Dashboard")
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Entities Before", kg_stats["before"]["entities"])
+        col2.metric("New Entities", kg_stats["new_entities"])
+        col3.metric("Total Entities", kg_stats["after"]["entities"])
+        col4.metric("Duplicate Pairs", len(kg_stats["duplicates"]))
+
+        duplicates = kg_stats["duplicates"]
+        if duplicates:
+            same_label = [d for d in duplicates if d["match_type"] == "same_label"]
+            cross_label = [d for d in duplicates if d["match_type"] == "cross_label"]
+            overlap_pct = (len(duplicates) / kg_stats["after"]["entities"]) * 100 if kg_stats["after"]["entities"] else 0
+            st.warning(f"**{len(duplicates)} duplicate entity pairs found** ({overlap_pct:.1f}% of total entities)")
+
+            if same_label:
+                with st.expander(f"Same-type duplicates — high confidence ({len(same_label)})"):
+                    dup_display = [{"Name": d["name"], "Type": d["label_a"]} for d in same_label]
+                    st.dataframe(dup_display, use_container_width=True, hide_index=True)
+
+            if cross_label:
+                with st.expander(f"Cross-type duplicates — needs review ({len(cross_label)})"):
+                    dup_display = [{"Name": d["name"], "Type A": d["label_a"], "Type B": d["label_b"]} for d in cross_label]
+                    st.dataframe(dup_display, use_container_width=True, hide_index=True)
+        else:
+            st.success("No duplicate entities found. Graph is clean.")
+
+    # ── Entity Resolution ──
+    run_entity_resolution_section()
+
+    # ── External Web Sources ──
+    run_web_sources_section(gen_model)
 
     # ── Graph Visualization ──
     st.divider()
@@ -543,6 +575,280 @@ def main():
     # ── Step 3: Ask Questions ──
     st.divider()
     run_chat_section(gen_model)
+
+
+CONFIDENCE_COLORS = {"high": "#2ecc71", "medium": "#f39c12", "low": "#e74c3c", "error": "#95a5a6"}
+
+
+def run_entity_resolution_section():
+    st.divider()
+    st.header("Entity Resolution")
+
+    try:
+        neo4j_client = Neo4jClient()
+        driver = neo4j_client()
+        if not has_any_entities(driver):
+            st.info("No entities in graph. Build a Knowledge Graph first.")
+            neo4j_client.close()
+            return
+    except Exception:
+        st.warning("Could not connect to Neo4j.")
+        return
+
+    # ── Scoring controls ──
+    st.subheader("1. Find & Score Candidates")
+    score_col1, score_col2 = st.columns(2)
+    with score_col1:
+        scoring_level = st.radio(
+            "Scoring level",
+            ["Exact match (free)", "Exact + Embedding ($)", "Exact + Embedding + LLM ($$)"],
+            index=0,
+            help="Higher levels cost more but catch fuzzy duplicates",
+        )
+    with score_col2:
+        llm_model = st.selectbox("LLM Judge Model", ["gpt-4o-mini", "gpt-4o"], index=0,
+                                  help="Only used at LLM scoring level")
+
+    if st.button("Run Entity Resolution Scoring", type="primary"):
+        with st.spinner("Finding candidate pairs..."):
+            candidates = find_candidate_pairs(driver)
+            all_pairs = candidates["same_label"] + candidates["cross_label"]
+
+        if not all_pairs:
+            st.success("No duplicate candidates found. Graph is clean.")
+            neo4j_client.close()
+            return
+
+        st.info(f"Found **{len(candidates['same_label'])}** same-type and **{len(candidates['cross_label'])}** cross-type candidate pairs.")
+
+        # Level 1: Exact
+        scored = [score_exact(p) for p in all_pairs]
+
+        # Level 2: Embedding
+        if scoring_level in ("Exact + Embedding ($)", "Exact + Embedding + LLM ($$)"):
+            with st.spinner("Computing embedding similarity..."):
+                scored = score_embedding_batch(all_pairs)
+
+        # Level 3: LLM judge (only for ambiguous pairs)
+        if scoring_level == "Exact + Embedding + LLM ($$)":
+            ambiguous = [s for s in scored if s["confidence"] in ("medium", "low")]
+            if ambiguous:
+                with st.spinner(f"LLM judging {len(ambiguous)} ambiguous pairs..."):
+                    llm_scored = score_llm_batch(ambiguous, model=llm_model)
+                    llm_map = {(s["id_a"], s["id_b"]): s for s in llm_scored}
+                    scored = [llm_map.get((s["id_a"], s["id_b"]), s) for s in scored]
+
+        st.session_state["er_scored_pairs"] = scored
+
+    # ── Per-pair approval ──
+    scored_pairs = st.session_state.get("er_scored_pairs")
+    if scored_pairs:
+        st.subheader("2. Review & Approve Pairs")
+        st.caption("Check the pairs you want to merge. Uncheck to keep separate.")
+
+        sorted_pairs = sorted(scored_pairs, key=lambda x: (
+            {"high": 0, "medium": 1, "low": 2, "error": 3}.get(x["confidence"], 3),
+            -x["score"],
+        ))
+
+        if "er_approvals" not in st.session_state:
+            st.session_state["er_approvals"] = {
+                i: p["confidence"] == "high" for i, p in enumerate(sorted_pairs)
+            }
+
+        for i, pair in enumerate(sorted_pairs):
+            color = CONFIDENCE_COLORS.get(pair["confidence"], "#aaa")
+            col_check, col_info, col_detail = st.columns([0.5, 3, 4])
+
+            with col_check:
+                st.session_state["er_approvals"][i] = st.checkbox(
+                    "Merge", value=st.session_state["er_approvals"].get(i, False),
+                    key=f"er_pair_{i}", label_visibility="collapsed",
+                )
+
+            with col_info:
+                st.markdown(
+                    f'<span style="color:{color}; font-weight:bold;">{pair["confidence"].upper()}</span> '
+                    f'({pair["score_type"]}: {pair["score"]:.2f})  **{pair["name"]}**',
+                    unsafe_allow_html=True,
+                )
+
+            with col_detail:
+                type_info = (f'{pair["label_a"]}' if pair["label_a"] == pair["label_b"]
+                             else f'{pair["label_a"]} vs {pair["label_b"]}')
+                st.caption(f'{type_info} — {pair["reason"]}')
+
+        approved = [sorted_pairs[i] for i, checked in st.session_state["er_approvals"].items() if checked]
+        st.info(f"**{len(approved)}** of **{len(sorted_pairs)}** pairs approved for merge.")
+
+        # ── Clustering + Merge ──
+        st.subheader("3. Merge")
+
+        if not approved:
+            st.warning("No pairs approved. Check at least one pair above to enable merge.")
+        else:
+            clusters = build_transitive_clusters(approved)
+            oversized = [c for c in clusters if len(c) > 5]
+
+            with st.expander(f"Preview: {len(clusters)} merge clusters"):
+                for ci, cluster in enumerate(clusters):
+                    names = [f'{n["name"]} ({n["label"]})' for n in cluster]
+                    survivor = names[0]
+                    icon = "!" if len(cluster) > 5 else str(ci + 1)
+                    st.markdown(f"**Cluster {icon}:** Keep **{survivor}**, merge: {', '.join(names[1:])}")
+
+            if oversized:
+                st.warning(f"{len(oversized)} cluster(s) exceed 5 members — review carefully before merging.")
+
+            if st.button("Execute Merge", type="primary"):
+                merge_log = []
+                progress = st.progress(0, text="Merging clusters...")
+
+                for ci, cluster in enumerate(clusters):
+                    result = merge_cluster(driver, cluster)
+                    merge_log.append(result)
+                    progress.progress((ci + 1) / len(clusters), text=f"Merged cluster {ci + 1}/{len(clusters)}")
+
+                st.session_state["merge_log"] = merge_log
+
+                total_merged = sum(r["dropped_count"] for r in merge_log if r["status"] == "merged")
+                st.success(f"Merged {total_merged} duplicate nodes across {len(clusters)} clusters.")
+
+                # Refresh stats
+                stats_after = get_graph_stats(driver)
+                st.session_state["kg_stats"]["after"] = stats_after
+                st.session_state["kg_stats"]["duplicates"] = find_duplicate_entities(driver)
+
+                # Check for orphans
+                orphans = find_orphaned_nodes(driver)
+                if orphans:
+                    st.warning(f"{len(orphans)} orphaned node(s) detected after merge:")
+                    st.dataframe(
+                        [{"Name": o["name"], "Type": o["label"]} for o in orphans],
+                        use_container_width=True, hide_index=True,
+                    )
+
+                # Clear scored pairs since graph changed
+                st.session_state.pop("er_scored_pairs", None)
+                st.session_state.pop("er_approvals", None)
+
+    # ── Undo ──
+    merge_log = st.session_state.get("merge_log")
+    if merge_log:
+        all_snapshots = []
+        for entry in merge_log:
+            if entry.get("snapshots"):
+                all_snapshots.extend(entry["snapshots"])
+
+        if all_snapshots:
+            st.divider()
+            if st.button("Undo Last Merge", type="secondary"):
+                with st.spinner("Restoring merged nodes..."):
+                    restored = undo_merge(driver, all_snapshots)
+                    st.success(f"Restored {restored} node(s). Note: re-run scoring to verify graph state.")
+                    st.session_state.pop("merge_log", None)
+
+    neo4j_client.close()
+
+
+def run_web_sources_section(gen_model: str):
+    st.divider()
+    st.header("External Web Sources")
+    st.caption("Augment your knowledge graph with related web content")
+
+    ttl_result = st.session_state.get("ttl_result")
+    docs = st.session_state.get("docs")
+    if not ttl_result or not docs:
+        st.info("Generate an ontology and build a Knowledge Graph first.")
+        return
+
+    try:
+        neo4j_client = Neo4jClient()
+        driver = neo4j_client()
+        if not has_any_entities(driver):
+            st.info("No entities in graph. Build a Knowledge Graph first.")
+            neo4j_client.close()
+            return
+    except Exception:
+        st.warning("Could not connect to Neo4j.")
+        return
+
+    # Show existing web stats if present
+    try:
+        ws = get_web_source_stats(driver)
+        if ws["web_chunks"] > 0:
+            st.session_state["web_sources_enabled"] = True
+            st.success(f"Web content active: **{ws['web_chunks']}** web chunks, **{ws['similar_to_edges']}** SIMILAR_TO edges (avg weight: {ws['avg_edge_weight']:.3f})")
+    except Exception:
+        pass
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        max_articles = st.slider("Max articles", 1, 10, 5, key="ws_max_articles")
+    with col2:
+        sim_threshold = st.slider("Similarity threshold", 0.3, 0.8, 0.5, 0.05,
+                                  key="ws_sim_threshold",
+                                  help="Min cosine similarity to create SIMILAR_TO edge")
+    with col3:
+        max_topics = st.slider("Max topics", 2, 7, 5, key="ws_max_topics")
+
+    if st.button("Fetch & Process Web Sources", type="primary"):
+        with st.status("Processing web sources...", expanded=True) as ws_status:
+            ws_status.update(label="Extracting key topics from your documents...")
+            topics = extract_topics(docs, model=gen_model, max_topics=max_topics)
+            st.info(f"Topics: {', '.join(topics)}")
+
+            ws_status.update(label="Searching the web via OpenAI...")
+            web_docs = search_and_fetch(topics[:max_articles], model=gen_model)
+
+            if not web_docs:
+                st.warning("No content found. Try different documents or topics.")
+                ws_status.update(label="No results", state="error")
+                neo4j_client.close()
+                return
+
+            st.info(f"Fetched web content for **{len(web_docs)}** topics")
+            with st.expander("Web search results"):
+                for r in web_docs:
+                    st.markdown(f"- **{r['name']}** — {len(r['text'])} chars")
+
+            ws_status.update(label=f"Building web knowledge graph ({gen_model})...")
+            schema = ontology_to_schema(ttl_result)
+            progress = st.progress(0, text="Processing web articles...")
+
+            def on_web_complete(done, total, name):
+                progress.progress(done / total, text=f"Web article {done}/{total}: {name}")
+
+            build_web_knowledge_graph(driver, schema, web_docs, gen_model, on_complete=on_web_complete)
+
+            ws_status.update(label="Computing SIMILAR_TO edges...")
+            edge_stats = compute_similar_to_edges(driver, similarity_threshold=sim_threshold)
+
+            st.session_state["web_sources_enabled"] = True
+            st.session_state["web_source_stats"] = edge_stats
+
+            ws_status.update(label="Done!", state="complete")
+
+    ws_stats = st.session_state.get("web_source_stats")
+    if ws_stats:
+        mcol1, mcol2, mcol3 = st.columns(3)
+        mcol1.metric("SIMILAR_TO Edges", ws_stats["edges_created"])
+        mcol2.metric("Avg Similarity", f"{ws_stats['avg_similarity']:.3f}")
+        mcol3.metric("Max Similarity", f"{ws_stats['max_similarity']:.3f}")
+
+    if st.session_state.get("web_sources_enabled"):
+        if st.button("Remove All Web Content", type="secondary"):
+            with st.spinner("Removing web content..."):
+                result = remove_web_content(driver)
+                st.success(
+                    f"Removed {result['web_chunks_removed']} web chunks, "
+                    f"{result['web_documents_removed']} web documents, "
+                    f"{result['edges_removed']} SIMILAR_TO edges."
+                )
+                st.session_state["web_sources_enabled"] = False
+                st.session_state.pop("web_source_stats", None)
+
+    neo4j_client.close()
 
 
 COLOR_PALETTE = [
@@ -559,25 +865,20 @@ def run_graph_visualization():
     try:
         neo4j_client = Neo4jClient()
         driver = neo4j_client()
-        domains = get_existing_domains(driver)
+        if not has_any_entities(driver):
+            st.info("No graph to visualize. Build a Knowledge Graph first.")
+            neo4j_client.close()
+            return
     except Exception:
         st.warning("Could not connect to Neo4j.")
         return
 
-    if not domains:
-        st.info("No graph to visualize. Build a Knowledge Graph first.")
-        return
-
-    col1, col2 = st.columns(2)
-    with col1:
-        viz_domain = st.selectbox("Domain", options=sorted(domains), key="viz_domain")
-    with col2:
-        node_limit = st.slider("Max nodes", min_value=20, max_value=500, value=100, step=20, key="viz_limit")
+    node_limit = st.slider("Max nodes", min_value=20, max_value=500, value=100, step=20, key="viz_limit")
 
     if st.button("Visualize Graph"):
         with st.spinner("Loading graph..."):
             try:
-                html, legend = build_graph_html(driver, viz_domain, node_limit)
+                html, legend = build_graph_html(driver, node_limit)
                 if legend:
                     cols = st.columns(min(len(legend), 6))
                     for i, (label, color) in enumerate(legend.items()):
@@ -592,28 +893,28 @@ def run_graph_visualization():
     neo4j_client.close()
 
 
-def build_graph_html(driver, domain: str, limit: int) -> tuple[str, dict]:
+def build_graph_html(driver, limit: int) -> tuple[str, dict]:
     node_query = """
     MATCH (n)
-    WHERE n.domain = $domain AND n.name IS NOT NULL
-      AND NONE(lbl IN labels(n) WHERE lbl IN ['Document', 'Chunk'])
+    WHERE n.name IS NOT NULL
+      AND NONE(lbl IN labels(n) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
     RETURN elementId(n) AS id, n.name AS name, labels(n) AS labels
     LIMIT $limit
     """
     rel_query = """
     MATCH (a)-[r]->(b)
-    WHERE a.domain = $domain AND b.domain = $domain
-      AND a.name IS NOT NULL AND b.name IS NOT NULL
-      AND NONE(lbl IN labels(a) WHERE lbl IN ['Document', 'Chunk'])
-      AND NONE(lbl IN labels(b) WHERE lbl IN ['Document', 'Chunk'])
-      AND NOT type(r) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK']
+    WHERE a.name IS NOT NULL AND b.name IS NOT NULL
+      AND NONE(lbl IN labels(a) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
+      AND NONE(lbl IN labels(b) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
+      AND NOT type(r) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO']
     WITH a, r, b LIMIT $limit
-    RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS rel_type
+    RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS rel_type,
+           coalesce(r.weight, 1.0) AS weight
     """
 
     with driver.session() as session:
-        nodes = session.run(node_query, domain=domain, limit=limit).data()
-        rels = session.run(rel_query, domain=domain, limit=limit * 3).data()
+        nodes = session.run(node_query, limit=limit).data()
+        rels = session.run(rel_query, limit=limit * 3).data()
 
     # Count connections per node for sizing
     degree: dict[str, int] = {}
@@ -625,7 +926,7 @@ def build_graph_html(driver, domain: str, limit: int) -> tuple[str, dict]:
     all_types = set()
     for node in nodes:
         for lbl in node["labels"]:
-            if lbl not in ("__Entity__", "Document", "Chunk"):
+            if lbl not in ("__Entity__", "Document", "Chunk", "WebDocument", "WebChunk"):
                 all_types.add(lbl)
     type_colors = {}
     for i, t in enumerate(sorted(all_types)):
@@ -656,15 +957,18 @@ def build_graph_html(driver, domain: str, limit: int) -> tuple[str, dict]:
 
     for rel in rels:
         if rel["source"] in node_ids and rel["target"] in node_ids:
+            w = rel.get("weight", 1.0)
+            edge_width = 0.5 + w * 3.0
+            opacity = max(0.3, w)
             net.add_edge(
                 rel["source"],
                 rel["target"],
-                title=rel["rel_type"],
+                title=f'{rel["rel_type"]} (weight: {w:.2f})',
                 label=rel["rel_type"],
-                color={"color": "#555555", "highlight": "#ffffff"},
+                color={"color": f"rgba(85,85,85,{opacity})", "highlight": "#ffffff"},
                 font={"size": 8, "color": "#aaaaaa", "strokeWidth": 0},
                 arrows="to",
-                width=1.5,
+                width=edge_width,
             )
 
     return net.generate_html(), type_colors
@@ -676,19 +980,29 @@ def run_chat_section(gen_model: str):
     try:
         neo4j_client = Neo4jClient()
         driver = neo4j_client()
-        domains = get_existing_domains(driver)
+        has_data = has_any_entities(driver)
         neo4j_client.close()
     except Exception:
         st.warning("Could not connect to Neo4j. Build a Knowledge Graph first.")
         return
 
-    if not domains:
-        st.info("No domains found in the graph. Build a Knowledge Graph first.")
+    if not has_data:
+        st.info("No entities found in the graph. Build a Knowledge Graph first.")
         return
 
-    domain_options = ["All domains"] + sorted(domains)
-    selected_domain = st.selectbox("Scope query to domain", options=domain_options)
-    domain = None if selected_domain == "All domains" else selected_domain
+    ret_col1, ret_col2, ret_col3 = st.columns(3)
+    with ret_col1:
+        hops = st.select_slider("Reasoning hops", options=[1, 2], value=2,
+                                help="1 = direct relationships only. 2 = multi-hop reasoning (follows neighbor's neighbors).")
+    with ret_col2:
+        weight_threshold = st.slider("Weight threshold", min_value=0.0, max_value=0.5, value=0.1, step=0.05,
+                                     help="Ignore edges below this weight during retrieval.")
+    with ret_col3:
+        web_available = st.session_state.get("web_sources_enabled", False)
+        include_web = st.checkbox("Include web sources", value=False,
+                                  disabled=not web_available,
+                                  help="Follow SIMILAR_TO edges to include supplementary web context" if web_available
+                                       else "Fetch web sources first to enable this")
 
     if "chat_history" not in st.session_state:
         st.session_state["chat_history"] = []
@@ -709,7 +1023,9 @@ def run_chat_section(gen_model: str):
                 try:
                     neo4j_client = Neo4jClient()
                     driver = neo4j_client()
-                    result = query_graph_rag(driver, question, gen_model, domain)
+                    result = query_graph_rag(driver, question, gen_model,
+                                            hops=hops, weight_threshold=weight_threshold,
+                                            include_web_sources=include_web)
                     neo4j_client.close()
 
                     answer = result["answer"]
