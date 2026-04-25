@@ -30,6 +30,12 @@ from graph import (
     find_duplicate_entities,
     has_any_entities,
     compute_edge_weights,
+    embed_all_entity_types,
+    embed_relationships,
+    embed_entities_by_type,
+    get_embedding_stats,
+    ENTITY_INDEX_CONFIGS,
+    EMBEDDING_DIMENSIONS,
 )
 from entity_resolution import (
     find_candidate_pairs,
@@ -60,7 +66,15 @@ def extract_text(uploaded_file) -> str:
     name = uploaded_file.name.lower()
 
     if name.endswith(".txt"):
-        return uploaded_file.read().decode("utf-8")
+        # Try multiple encodings to handle various file encodings
+        raw_bytes = uploaded_file.read()
+        for encoding in ("utf-8", "latin-1", "cp1252", "iso-8859-1", "utf-16"):
+            try:
+                return raw_bytes.decode(encoding)
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        # Fallback: replace problematic characters
+        return raw_bytes.decode("utf-8", errors="replace")
 
     if name.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(uploaded_file.read()))
@@ -193,8 +207,13 @@ def extract_registry(ttl_string: str) -> set[str]:
 # LLM calls
 # ---------------------------------------------------------------------------
 def call_prompt_1a(client: OpenAI, model: str, doc_text: str, registry_text: str = "") -> str:
+    # Read poml file with UTF 8 encoding
+    poml_path = PROMPTS_DIR / "ontology_prompt.poml"
+    with open(poml_path, "r", encoding="utf-8", errors="replace") as f:
+        poml_content = f.read()
+    
     params = poml(
-        str(PROMPTS_DIR / "ontology_prompt.poml"),
+        poml_content,
         context={"documents": doc_text, "registry": registry_text},
         format="openai_chat",
     )
@@ -206,8 +225,12 @@ def call_prompt_1a(client: OpenAI, model: str, doc_text: str, registry_text: str
 
 
 def call_prompt_1b(client: OpenAI, model: str, doc_text: str, existing_ttl: str) -> str:
+    poml_path = PROMPTS_DIR / "refine_ontology.poml"
+    with open(poml_path, "r", encoding="utf-8", errors="replace") as f:
+        poml_content = f.read()
+    
     params = poml(
-        str(PROMPTS_DIR / "refine_ontology.poml"),
+        poml_content,
         context={"documents": doc_text, "existing_ttl": existing_ttl},
         format="openai_chat",
     )
@@ -218,8 +241,12 @@ def call_prompt_1b(client: OpenAI, model: str, doc_text: str, existing_ttl: str)
 
 
 def call_prompt_2(client: OpenAI, model: str, ttl_content: str, errors: str = "") -> str:
+    poml_path = PROMPTS_DIR / "validate_syntax.poml"
+    with open(poml_path, "r", encoding="utf-8", errors="replace") as f:
+        poml_content = f.read()
+    
     params = poml(
-        str(PROMPTS_DIR / "validate_syntax.poml"),
+        poml_content,
         context={"ttl_content": ttl_content, "errors": errors},
         format="openai_chat",
     )
@@ -565,6 +592,9 @@ def main():
     # ── Entity Resolution ──
     run_entity_resolution_section()
 
+    # ── Advanced Vector Embeddings ──
+    run_advanced_embeddings_section()
+
     # ── External Web Sources ──
     run_web_sources_section(gen_model)
 
@@ -747,6 +777,112 @@ def run_entity_resolution_section():
                     restored = undo_merge(driver, all_snapshots)
                     st.success(f"Restored {restored} node(s). Note: re-run scoring to verify graph state.")
                     st.session_state.pop("merge_log", None)
+
+    neo4j_client.close()
+
+def run_advanced_embeddings_section():
+    st.divider()
+    st.header("Advanced Vector Embeddings")
+    st.caption("Multi-index embeddings for entities and relationships beyond Chunk nodes")
+
+    try:
+        neo4j_client = Neo4jClient()
+        driver = neo4j_client()
+        if not has_any_entities(driver):
+            st.info("No entities in graph. Build a Knowledge Graph first.")
+            neo4j_client.close()
+            return
+    except Exception:
+        st.warning("Could not connect to Neo4j.")
+        return
+
+    # Embedding Stats
+    st.subheader("Embedding Statistics")
+    if st.button("Refresh Embedding Stats"):
+        with st.spinner("Computing embedding statistics..."):
+            stats = get_embedding_stats(driver)
+            st.session_state["embedding_stats"] = stats
+
+    stats = st.session_state.get("embedding_stats")
+    if stats:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Chunks with Embeddings", stats.get("chunks_with_embeddings", 0))
+        col2.metric("Entities with Embeddings", sum(stats.get("entities_with_embeddings", {}).values()))
+        col3.metric("Relationships with Embeddings", stats.get("relationships_with_embeddings", 0))
+
+        if stats.get("entities_with_embeddings"):
+            st.write("**Entities by type:**")
+            for label, cnt in stats["entities_with_embeddings"].items():
+                st.write(f"  - {label}: {cnt}")
+
+    # Embed All Entity Types
+    st.subheader("Embed All Entity Types")
+    st.caption("Automatically detect entity types and create vector indexes for each")
+
+    if st.button("Embed All Entity Types", type="primary"):
+        with st.spinner("Embedding all entity types..."):
+            results = embed_all_entity_types(driver)
+            
+        st.success(f"Embedded {sum(r['indexed'] for r in results.values())} entities across {len(results)} types")
+        for entity_type, result in results.items():
+            st.write(f"  - {entity_type}: {result['indexed']} indexed, properties: {result.get('properties', [])}")
+
+    # ── Embed Specific Entity Type ──
+    st.subheader("Embed Specific Entity Type")
+    
+    # Get available entity types
+    with driver.session() as session:
+        types = list(session.run("""
+            MATCH (n) WHERE n.name IS NOT NULL 
+              AND NONE(lbl IN labels(n) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
+            UNWIND labels(n) AS label DISTINCT label
+        """))
+        available_types = [dict(t)["label"] for t in types]
+
+    if available_types:
+        selected_type = st.selectbox("Select Entity Type", available_types)
+        
+        # Get properties for this type
+        with driver.session() as session:
+            props_result = list(session.run(f"""
+                MATCH (n:{selected_type}) 
+                WHERE n.name IS NOT NULL
+                RETURN keys(n) AS keys
+                LIMIT 1
+            """))
+            available_props = list(props_result[0].values())[0] if props_result else ["name"]
+        
+        embedding_props = st.multiselect(
+            "Properties to include in embedding",
+            options=available_props,
+            default=["name", "description"] if "description" in available_props else ["name"],
+        )
+        
+        if st.button(f"Embed {selected_type} Entities"):
+            config = ENTITY_INDEX_CONFIGS.get(selected_type, {
+                "index_name": f"{selected_type.lower()}_embedding_index",
+                "dimensions": EMBEDDING_DIMENSIONS,
+            })
+            
+            with st.spinner(f"Embedding {selected_type} entities..."):
+                result = embed_entities_by_type(
+                    driver,
+                    entity_type=selected_type,
+                    embedding_props=embedding_props,
+                    index_name=config["index_name"],
+                    dimensions=config.get("dimensions", EMBEDDING_DIMENSIONS),
+                )
+            
+            st.success(f"Indexed {result['indexed']} {selected_type} entities")
+
+    # Embed Relationships
+    st.subheader("Embed Relationships")
+    st.caption("Create embeddings for relationships based on source-type-target context")
+
+    if st.button("Embed All Relationships", type="secondary"):
+        with st.spinner("Embedding relationships..."):
+            result = embed_relationships(driver)
+        st.success(f"Indexed {result['indexed']} relationships")
 
     neo4j_client.close()
 
