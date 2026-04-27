@@ -26,10 +26,17 @@ from graph import (
     ontology_to_schema,
     build_knowledge_graph,
     query_graph_rag,
+    query_agentic_rag,
     get_graph_stats,
     find_duplicate_entities,
     has_any_entities,
     compute_edge_weights,
+    embed_all_entity_types,
+    embed_relationships,
+    embed_entities_by_type,
+    get_embedding_stats,
+    ENTITY_INDEX_CONFIGS,
+    EMBEDDING_DIMENSIONS,
 )
 from entity_resolution import (
     find_candidate_pairs,
@@ -60,7 +67,15 @@ def extract_text(uploaded_file) -> str:
     name = uploaded_file.name.lower()
 
     if name.endswith(".txt"):
-        return uploaded_file.read().decode("utf-8")
+        # Try multiple encodings to handle various file encodings
+        raw_bytes = uploaded_file.read()
+        for encoding in ("utf-8", "latin-1", "cp1252", "iso-8859-1", "utf-16"):
+            try:
+                return raw_bytes.decode(encoding)
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        # Fallback: replace problematic characters
+        return raw_bytes.decode("utf-8", errors="replace")
 
     if name.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(uploaded_file.read()))
@@ -193,8 +208,13 @@ def extract_registry(ttl_string: str) -> set[str]:
 # LLM calls
 # ---------------------------------------------------------------------------
 def call_prompt_1a(client: OpenAI, model: str, doc_text: str, registry_text: str = "") -> str:
+    # Read poml file with UTF 8 encoding
+    poml_path = PROMPTS_DIR / "ontology_prompt.poml"
+    with open(poml_path, "r", encoding="utf-8", errors="replace") as f:
+        poml_content = f.read()
+    
     params = poml(
-        str(PROMPTS_DIR / "ontology_prompt.poml"),
+        poml_content,
         context={"documents": doc_text, "registry": registry_text},
         format="openai_chat",
     )
@@ -206,8 +226,12 @@ def call_prompt_1a(client: OpenAI, model: str, doc_text: str, registry_text: str
 
 
 def call_prompt_1b(client: OpenAI, model: str, doc_text: str, existing_ttl: str) -> str:
+    poml_path = PROMPTS_DIR / "refine_ontology.poml"
+    with open(poml_path, "r", encoding="utf-8", errors="replace") as f:
+        poml_content = f.read()
+    
     params = poml(
-        str(PROMPTS_DIR / "refine_ontology.poml"),
+        poml_content,
         context={"documents": doc_text, "existing_ttl": existing_ttl},
         format="openai_chat",
     )
@@ -218,8 +242,12 @@ def call_prompt_1b(client: OpenAI, model: str, doc_text: str, existing_ttl: str)
 
 
 def call_prompt_2(client: OpenAI, model: str, ttl_content: str, errors: str = "") -> str:
+    poml_path = PROMPTS_DIR / "validate_syntax.poml"
+    with open(poml_path, "r", encoding="utf-8", errors="replace") as f:
+        poml_content = f.read()
+    
     params = poml(
-        str(PROMPTS_DIR / "validate_syntax.poml"),
+        poml_content,
         context={"ttl_content": ttl_content, "errors": errors},
         format="openai_chat",
     )
@@ -565,6 +593,9 @@ def main():
     # ── Entity Resolution ──
     run_entity_resolution_section()
 
+    # ── Advanced Vector Embeddings ──
+    run_advanced_embeddings_section()
+
     # ── External Web Sources ──
     run_web_sources_section(gen_model)
 
@@ -747,6 +778,112 @@ def run_entity_resolution_section():
                     restored = undo_merge(driver, all_snapshots)
                     st.success(f"Restored {restored} node(s). Note: re-run scoring to verify graph state.")
                     st.session_state.pop("merge_log", None)
+
+    neo4j_client.close()
+
+def run_advanced_embeddings_section():
+    st.divider()
+    st.header("Advanced Vector Embeddings")
+    st.caption("Multi-index embeddings for entities and relationships beyond Chunk nodes")
+
+    try:
+        neo4j_client = Neo4jClient()
+        driver = neo4j_client()
+        if not has_any_entities(driver):
+            st.info("No entities in graph. Build a Knowledge Graph first.")
+            neo4j_client.close()
+            return
+    except Exception:
+        st.warning("Could not connect to Neo4j.")
+        return
+
+    # Embedding Stats
+    st.subheader("Embedding Statistics")
+    if st.button("Refresh Embedding Stats"):
+        with st.spinner("Computing embedding statistics..."):
+            stats = get_embedding_stats(driver)
+            st.session_state["embedding_stats"] = stats
+
+    stats = st.session_state.get("embedding_stats")
+    if stats:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Chunks with Embeddings", stats.get("chunks_with_embeddings", 0))
+        col2.metric("Entities with Embeddings", sum(stats.get("entities_with_embeddings", {}).values()))
+        col3.metric("Relationships with Embeddings", stats.get("relationships_with_embeddings", 0))
+
+        if stats.get("entities_with_embeddings"):
+            st.write("**Entities by type:**")
+            for label, cnt in stats["entities_with_embeddings"].items():
+                st.write(f"  - {label}: {cnt}")
+
+    # Embed All Entity Types
+    st.subheader("Embed All Entity Types")
+    st.caption("Automatically detect entity types and create vector indexes for each")
+
+    if st.button("Embed All Entity Types", type="primary"):
+        with st.spinner("Embedding all entity types..."):
+            results = embed_all_entity_types(driver)
+            
+        st.success(f"Embedded {sum(r['indexed'] for r in results.values())} entities across {len(results)} types")
+        for entity_type, result in results.items():
+            st.write(f"  - {entity_type}: {result['indexed']} indexed, properties: {result.get('properties', [])}")
+
+    # ── Embed Specific Entity Type ──
+    st.subheader("Embed Specific Entity Type")
+    
+    # Get available entity types
+    with driver.session() as session:
+        types = list(session.run("""
+            MATCH (n) WHERE n.name IS NOT NULL 
+              AND NONE(lbl IN labels(n) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
+            UNWIND labels(n) AS label DISTINCT label
+        """))
+        available_types = [dict(t)["label"] for t in types]
+
+    if available_types:
+        selected_type = st.selectbox("Select Entity Type", available_types)
+        
+        # Get properties for this type
+        with driver.session() as session:
+            props_result = list(session.run(f"""
+                MATCH (n:{selected_type}) 
+                WHERE n.name IS NOT NULL
+                RETURN keys(n) AS keys
+                LIMIT 1
+            """))
+            available_props = list(props_result[0].values())[0] if props_result else ["name"]
+        
+        embedding_props = st.multiselect(
+            "Properties to include in embedding",
+            options=available_props,
+            default=["name", "description"] if "description" in available_props else ["name"],
+        )
+        
+        if st.button(f"Embed {selected_type} Entities"):
+            config = ENTITY_INDEX_CONFIGS.get(selected_type, {
+                "index_name": f"{selected_type.lower()}_embedding_index",
+                "dimensions": EMBEDDING_DIMENSIONS,
+            })
+            
+            with st.spinner(f"Embedding {selected_type} entities..."):
+                result = embed_entities_by_type(
+                    driver,
+                    entity_type=selected_type,
+                    embedding_props=embedding_props,
+                    index_name=config["index_name"],
+                    dimensions=config.get("dimensions", EMBEDDING_DIMENSIONS),
+                )
+            
+            st.success(f"Indexed {result['indexed']} {selected_type} entities")
+
+    # Embed Relationships
+    st.subheader("Embed Relationships")
+    st.caption("Create embeddings for relationships based on source-type-target context")
+
+    if st.button("Embed All Relationships", type="secondary"):
+        with st.spinner("Embedding relationships..."):
+            result = embed_relationships(driver)
+        st.success(f"Indexed {result['indexed']} relationships")
 
     neo4j_client.close()
 
@@ -990,14 +1127,20 @@ def run_chat_section(gen_model: str):
         st.info("No entities found in the graph. Build a Knowledge Graph first.")
         return
 
-    ret_col1, ret_col2, ret_col3 = st.columns(3)
+    ret_col1, ret_col2, ret_col3, ret_col4 = st.columns(4)
     with ret_col1:
+        retrieval_mode = st.selectbox(
+            "Retrieval mode",
+            ["Auto", "Hybrid", "Hybrid Enriched", "Vector", "Graph", "Fuzzy"],
+            index=0,
+        )
+    with ret_col2:
         hops = st.select_slider("Reasoning hops", options=[1, 2], value=2,
                                 help="1 = direct relationships only. 2 = multi-hop reasoning (follows neighbor's neighbors).")
-    with ret_col2:
+    with ret_col3:
         weight_threshold = st.slider("Weight threshold", min_value=0.0, max_value=0.5, value=0.1, step=0.05,
                                      help="Ignore edges below this weight during retrieval.")
-    with ret_col3:
+    with ret_col4:
         web_available = st.session_state.get("web_sources_enabled", False)
         include_web = st.checkbox("Include web sources", value=False,
                                   disabled=not web_available,
@@ -1023,20 +1166,37 @@ def run_chat_section(gen_model: str):
                 try:
                     neo4j_client = Neo4jClient()
                     driver = neo4j_client()
-                    result = query_graph_rag(driver, question, gen_model,
-                                            hops=hops, weight_threshold=weight_threshold,
-                                            include_web_sources=include_web)
+                    result = query_agentic_rag(driver, question, gen_model,
+                                               mode=retrieval_mode,
+                                               hops=hops,
+                                               weight_threshold=weight_threshold,
+                                               top_k=5,
+                                               include_web_sources=include_web)
                     neo4j_client.close()
 
                     answer = result["answer"]
                     st.markdown(answer)
                     st.session_state["chat_history"].append({"role": "assistant", "content": answer})
 
-                    if result["context"] and result["context"].items:
+                    if result.get("selected_mode") or result.get("routing_reason"):
+                        with st.expander("Retrieval route"):
+                            st.write(f"**Selected mode:** {result.get('selected_mode', result.get('retriever', 'N/A'))}")
+                            st.write(result.get("routing_reason", "No routing reason returned."))
+                            if result.get("latency_ms") is not None:
+                                st.write(f"**Latency:** {result['latency_ms']} ms")
+
+                    context = result.get("context")
+                    if context and hasattr(context, "items") and context.items:
                         with st.expander("Retrieved context"):
-                            for i, item in enumerate(result["context"].items, 1):
+                            for i, item in enumerate(context.items, 1):
                                 st.markdown(f"**Chunk {i}** (score: {item.metadata.get('score', 'N/A') if item.metadata else 'N/A'})")
                                 st.text(str(item.content)[:500])
+                                st.divider()
+                    elif context and isinstance(context, list):
+                        with st.expander("Retrieved context"):
+                            for i, item in enumerate(context, 1):
+                                st.markdown(f"**Context {i}**")
+                                st.text(str(item)[:1000])
                                 st.divider()
 
                 except Exception as e:
