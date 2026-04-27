@@ -26,6 +26,7 @@ from graph import (
     ontology_to_schema,
     build_knowledge_graph,
     query_graph_rag,
+    query_agentic_rag,
     get_graph_stats,
     find_duplicate_entities,
     has_any_entities,
@@ -1126,14 +1127,20 @@ def run_chat_section(gen_model: str):
         st.info("No entities found in the graph. Build a Knowledge Graph first.")
         return
 
-    ret_col1, ret_col2, ret_col3 = st.columns(3)
+    ret_col1, ret_col2, ret_col3, ret_col4 = st.columns(4)
     with ret_col1:
+        retrieval_mode = st.selectbox(
+            "Retrieval mode",
+            ["Auto", "Hybrid", "Hybrid Enriched", "Vector", "Graph", "Fuzzy"],
+            index=0,
+        )
+    with ret_col2:
         hops = st.select_slider("Reasoning hops", options=[1, 2], value=2,
                                 help="1 = direct relationships only. 2 = multi-hop reasoning (follows neighbor's neighbors).")
-    with ret_col2:
+    with ret_col3:
         weight_threshold = st.slider("Weight threshold", min_value=0.0, max_value=0.5, value=0.1, step=0.05,
                                      help="Ignore edges below this weight during retrieval.")
-    with ret_col3:
+    with ret_col4:
         web_available = st.session_state.get("web_sources_enabled", False)
         include_web = st.checkbox("Include web sources", value=False,
                                   disabled=not web_available,
@@ -1159,20 +1166,37 @@ def run_chat_section(gen_model: str):
                 try:
                     neo4j_client = Neo4jClient()
                     driver = neo4j_client()
-                    result = query_graph_rag(driver, question, gen_model,
-                                            hops=hops, weight_threshold=weight_threshold,
-                                            include_web_sources=include_web)
+                    result = query_agentic_rag(driver, question, gen_model,
+                                               mode=retrieval_mode,
+                                               hops=hops,
+                                               weight_threshold=weight_threshold,
+                                               top_k=5,
+                                               include_web_sources=include_web)
                     neo4j_client.close()
 
                     answer = result["answer"]
                     st.markdown(answer)
                     st.session_state["chat_history"].append({"role": "assistant", "content": answer})
 
-                    if result["context"] and result["context"].items:
+                    if result.get("selected_mode") or result.get("routing_reason"):
+                        with st.expander("Retrieval route"):
+                            st.write(f"**Selected mode:** {result.get('selected_mode', result.get('retriever', 'N/A'))}")
+                            st.write(result.get("routing_reason", "No routing reason returned."))
+                            if result.get("latency_ms") is not None:
+                                st.write(f"**Latency:** {result['latency_ms']} ms")
+
+                    context = result.get("context")
+                    if context and hasattr(context, "items") and context.items:
                         with st.expander("Retrieved context"):
-                            for i, item in enumerate(result["context"].items, 1):
+                            for i, item in enumerate(context.items, 1):
                                 st.markdown(f"**Chunk {i}** (score: {item.metadata.get('score', 'N/A') if item.metadata else 'N/A'})")
                                 st.text(str(item.content)[:500])
+                                st.divider()
+                    elif context and isinstance(context, list):
+                        with st.expander("Retrieved context"):
+                            for i, item in enumerate(context, 1):
+                                st.markdown(f"**Context {i}**")
+                                st.text(str(item)[:1000])
                                 st.divider()
 
                 except Exception as e:
