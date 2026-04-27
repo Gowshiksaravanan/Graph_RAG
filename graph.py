@@ -393,3 +393,312 @@ def query_graph_rag(
         "answer": result.answer,
         "context": result.retriever_result,
     }
+
+
+# ---------------------------------------------------------------------------
+# Advanced Vector Embedding Techniques
+# ---------------------------------------------------------------------------
+# Multi-index configuration for different node types
+ENTITY_INDEX_CONFIGS = {
+    "Person": {
+        "index_name": "person_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "Organization": {
+        "index_name": "organization_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "Location": {
+        "index_name": "location_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "Event": {
+        "index_name": "event_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "MagicalObject": {
+        "index_name": "magical_object_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "Creature": {
+        "index_name": "creature_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "Spell": {
+        "index_name": "spell_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "House": {
+        "index_name": "house_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "Product": {
+        "index_name": "product_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "Regulation": {
+        "index_name": "regulation_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "Technology": {
+        "index_name": "technology_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "Process": {
+        "index_name": "process_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+    "Department": {
+        "index_name": "department_embedding_index",
+        "embedding_props": ["name", "description"],
+        "dimensions": EMBEDDING_DIMENSIONS,
+    },
+}
+
+
+def _build_entity_text(node: dict, embedding_props: list[str]) -> str:
+    """Build composite text for entity embedding from multiple properties."""
+    parts = []
+    for prop in embedding_props:
+        if prop in node and node[prop]:
+            parts.append(str(node[prop]))
+    return " | ".join(parts)
+
+
+def embed_entities_by_type(
+    driver: Driver,
+    entity_type: str,
+    embedding_props: list[str],
+    index_name: str,
+    dimensions: int = EMBEDDING_DIMENSIONS,
+    batch_size: int = 100,
+) -> dict:
+    """
+    Embed all entities of a specific type using multiple properties.
+    
+    Creates composite embeddings from specified properties (like name + description)
+    and stores them in a dedicated vector index for that entity type.
+    """
+    embedder = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
+    
+    query = f"""
+    MATCH (n:{entity_type})
+    WHERE n.name IS NOT NULL
+    RETURN elementId(n) AS id, n.name AS name, 
+           coalesce(n.description, '') AS description,
+           labels(n) AS labels
+    """
+    
+    with driver.session() as session:
+        entities = list(session.run(query))
+    
+    if not entities:
+        logger.warning(f"No entities found for type: {entity_type}")
+        return {"indexed": 0, "type": entity_type}
+    
+    try:
+        create_vector_index(
+            driver,
+            name=index_name,
+            label=entity_type,
+            embedding_property="embedding",
+            dimensions=dimensions,
+            similarity_fn="cosine",
+        )
+    except Exception as e:
+        logger.debug(f"Index {index_name} may already exist: {e}")
+    
+    indexed = 0
+    for i in range(0, len(entities), batch_size):
+        batch = entities[i:i + batch_size]
+        
+        for record in batch:
+            node = dict(record)
+            composite_text = _build_entity_text(node, embedding_props)
+            
+            if composite_text and composite_text.strip():
+                embedding = embedder.embed_query(composite_text)
+                
+                # Update node with embedding
+                session.run(
+                    f"MATCH (n:{entity_type}) WHERE elementId(n) = $id "
+                    "SET n.embedding = $embedding",
+                    id=node["id"],
+                    embedding=embedding,
+                )
+                indexed += 1
+    
+    logger.info(f"Embedded {indexed} {entity_type} entities with properties: {embedding_props}")
+    return {"indexed": indexed, "type": entity_type, "properties": embedding_props}
+
+
+def embed_all_entity_types(driver: Driver) -> dict:
+    """
+    Embed all entity types in the knowledge graph.
+    
+    Automatically detects which entity types exist in the graph and creates
+    appropriate vector indexes for each.
+    """
+    # Discovers all entity types in the graph
+    type_query = """
+    MATCH (n)
+    WHERE n.name IS NOT NULL
+      AND NONE(lbl IN labels(n) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
+    UNWIND labels(n) AS label
+    DISTINCT label
+    """
+    
+    with driver.session() as session:
+        existing_types = [record["label"] for record in session.run(type_query)]
+    results = {}
+    for entity_type in existing_types:
+        if entity_type in ENTITY_INDEX_CONFIGS:
+            config = ENTITY_INDEX_CONFIGS[entity_type]
+        else:
+            config = {
+                "index_name": f"{entity_type.lower()}_embedding_index",
+                "embedding_props": ["name", "description"],
+                "dimensions": EMBEDDING_DIMENSIONS,
+            }
+        result = embed_entities_by_type(
+            driver,
+            entity_type=entity_type,
+            embedding_props=config["embedding_props"],
+            index_name=config["index_name"],
+            dimensions=config["dimensions"],
+        )
+        results[entity_type] = result
+    return results
+
+
+def embed_relationships(driver: Driver, batch_size: int = 100) -> dict:
+    """
+    Create embeddings for relationships based on connected entity context.
+    
+    Relationships are embedded by combining: source entity name + relationship type + target entity name.
+    This enables similarity search over relationship patterns.
+    """
+    embedder = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
+    
+    # Gets all relationships
+    rel_query = """
+    MATCH (a)-[r]->(b)
+    WHERE a.name IS NOT NULL AND b.name IS NOT NULL
+      AND NOT type(r) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO']
+    RETURN elementId(r) AS id, 
+           a.name AS source, 
+           type(r) AS rel_type, 
+           b.name AS target
+    """
+    
+    with driver.session() as session:
+        relationships = list(session.run(rel_query))
+    if not relationships:
+        logger.warning("No relationships found to embed")
+        return {"indexed": 0}
+    indexed = 0
+    for i in range(0, len(relationships), batch_size):
+        batch = relationships[i:i + batch_size]
+        for record in batch:
+            rel = dict(record)
+            composite_text = f"{rel['source']} --[{rel['rel_type']}]--> {rel['target']}"
+            embedding = embedder.embed_query(composite_text)
+            session.run(
+                "MATCH ()-[r]->() WHERE elementId(r) = $id SET r.embedding = $embedding",
+                id=rel["id"],
+                embedding=embedding,
+            )
+            indexed += 1
+    logger.info(f"Embedded {indexed} relationships")
+    return {"indexed": indexed}
+
+
+def create_hybrid_embedding(driver: Driver, node_label: str, property_names: list[str]) -> dict:
+    """
+    Create hybrid embeddings that combine multiple properties with different weights.
+    
+    Properties are weighted: primary (name) gets higher weight, secondary properties
+    are appended with lower influence on the embedding.
+    """
+    embedder = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
+    
+    primary_prop = property_names[0] if property_names else "name"
+    secondary_props = property_names[1:] if len(property_names) > 1 else []
+    
+    query = f"""
+    MATCH (n:{node_label})
+    WHERE n.{primary_prop} IS NOT NULL
+    RETURN elementId(n) AS id, n.{primary_prop} AS primary
+    """
+    
+    with driver.session() as session:
+        nodes = list(session.run(query))
+    
+    indexed = 0
+    for record in nodes:
+        node = dict(record)
+        primary_text = str(node.get("primary", ""))
+        
+        # builds hybrid text with weighted properties
+        hybrid_text = primary_text
+        if secondary_props:
+            secondary_query = f"MATCH (n:{node_label}) WHERE elementId(n) = $id RETURN n"
+            secondary_node = session.run(secondary_query, id=node["id"]).single()
+            if secondary_node:
+                secondary_vals = [str(secondary_node[n]) for n in secondary_props if secondary_node.get(n)]
+                if secondary_vals:
+                    hybrid_text = f"{primary_text} | Context: " + " | ".join(secondary_vals)
+        if hybrid_text.strip():
+            embedding = embedder.embed_query(hybrid_text)
+            session.run(
+                f"MATCH (n:{node_label}) WHERE elementId(n) = $id SET n.embedding = $embedding",
+                id=node["id"],
+                embedding=embedding,
+            )
+            indexed += 1
+    logger.info(f"Created hybrid embeddings for {indexed} {node_label} nodes")
+    return {"indexed": indexed, "label": node_label, "properties": property_names}
+
+
+def get_embedding_stats(driver: Driver) -> dict:
+    """Get statistics about embeddings in the knowledge graph."""
+    stats = {}
+    # Chunk embeddings
+    chunk_query = "MATCH (c:Chunk) WHERE c.embedding IS NOT NULL RETURN count(c) AS cnt"
+    with driver.session() as session:
+        stats["chunks_with_embeddings"] = session.run(chunk_query).single()["cnt"]
+    # Entity embeddings by type
+    entity_query = """
+    MATCH (n)
+    WHERE n.embedding IS NOT NULL
+      AND NONE(lbl IN labels(n) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
+    UNWIND labels(n) AS label
+    RETURN label, count(*) AS cnt
+    """
+    with driver.session() as session:
+        stats["entities_with_embeddings"] = {
+            row["label"]: row["cnt"] for row in session.run(entity_query)
+        }
+    # Relationship embeddings
+    rel_query = "MATCH ()-[r]->() WHERE r.embedding IS NOT NULL RETURN count(r) AS cnt"
+    with driver.session() as session:
+        stats["relationships_with_embeddings"] = session.run(rel_query).single()["cnt"]
+    # Vector indexes
+    index_query = "SHOW INDEXES YIELD name, labelsOrTypes, properties RETURN name, labelsOrTypes, properties"
+    with driver.session() as session:
+        stats["vector_indexes"] = [
+            dict(row) for row in session.run(index_query)
+        ]
+    return stats
