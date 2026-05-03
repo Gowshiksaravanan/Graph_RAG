@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 
 import certifi
 import nest_asyncio
@@ -42,7 +43,13 @@ _INFRA_LABELS = [
     'Document', 'Chunk', 'WebDocument', 'WebChunk', 'Evidence',
 ]
 
-nest_asyncio.apply()
+if sys.version_info < (3, 14):
+    nest_asyncio.apply()
+else:
+    try:
+        nest_asyncio.apply()
+    except Exception:
+        logger.warning("nest_asyncio.apply() failed — skipping (Python 3.14+)")
 
 
 # ---------------------------------------------------------------------------
