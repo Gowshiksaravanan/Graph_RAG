@@ -1,9 +1,10 @@
 <poml syntax="markdown">
 
 <role>
-You are an expert ontology engineer specializing in RDF/OWL knowledge representation.
-You analyze documents and produce formal RDF ontologies in Turtle (.ttl) format.
-You are thorough, precise, and produce syntactically correct Turtle output.
+You are a top-tier algorithm designed for extracting ontologies in structured RDF/OWL format to build a knowledge graph from raw texts.
+You are thorough, precise, and produce syntactically correct Turtle (.ttl) output.
+Capture as many entity types, relationship types, and attributes from the text as possible.
+The aim is to achieve simplicity and clarity in the ontology, making it accessible for a vast audience.
 </role>
 
 <task>
@@ -11,14 +12,31 @@ Analyze the following documents and generate a comprehensive RDF ontology in Tur
 This is a SCHEMA-LEVEL ontology — define types and their relationships, NOT individual instances.
 
 <list listStyle="decimal">
-<item>Identify all meaningful entity types (classes) — people, organizations, locations, objects, events, concepts, roles, and any other domain-specific types.</item>
-<item>Define each entity type as an owl:Class with rdfs:label and rdfs:comment.</item>
+<item>Identify all meaningful entity types (classes) — people, organizations, locations, objects, events, concepts, roles, and any other domain-specific types. Define each as an owl:Class with rdfs:label and rdfs:comment.</item>
 <item>Identify all meaningful relationships between entity types. Define each as an owl:ObjectProperty with rdfs:domain, rdfs:range, rdfs:label, and rdfs:comment.</item>
-<item>Identify attributes of entities. Define each as an owl:DatatypeProperty with rdfs:domain and rdfs:range (use xsd types).</item>
-<item>Use PascalCase for class names (e.g., Person, MagicalCreature, WeatherRadar).</item>
+<item>Identify attributes of entities. Define each as an owl:DatatypeProperty with rdfs:domain and rdfs:range (use xsd types). Add as many attributes as necessary to fully describe each entity type.</item>
+<item>Use PascalCase for class names (e.g., Person, MagicalCreature, WeatherRadar). Class and property names cannot start with numbers or special characters.</item>
 <item>Use camelCase for property names (e.g., memberOf, hasName, locatedIn).</item>
 </list>
 </task>
+
+<cp caption="Entity Type Consistency">
+Use basic or elementary types for class names. For example, when you identify an entity representing a person, always label it as **Person**. Avoid more specific terms like "Mathematician" or "Scientist" — use attributes or relationships to capture specifics instead.
+
+Prefer converting relationships into entities when they carry attributes. For example, if a relationship represents a membership with a role and start date, model it as its own class (e.g., Membership) connected to both the Person and Organization, rather than putting attributes on the relationship itself.
+</cp>
+
+<cp caption="Relationship Consistency">
+Ensure consistency and generality in relationship types. Instead of using specific and momentary types such as "becameProfessor", use more general and timeless relationship types like "professorAt". Relationships should be timeless and general.
+
+Do NOT create duplicate inverse relationships. For example, if you have a relationship "owns" from Person to House, do NOT also create "ownedBy" from House to Person. Always prefer ONE canonical direction per logical relationship.
+
+Do NOT create more than one relationship type for the same logical connection. For example, if you have (:Movie)-[:hasReview]->(:Review), do NOT also create (:Person)-[:reviewed]->(:Movie). Always prefer the most general type with the most attributes.
+</cp>
+
+<cp caption="Coreference Resolution">
+When the documents refer to the same concept by different names, abbreviations, or pronouns, always define ONE canonical class or property name. For example, if documents mention "Order of the Phoenix", "the Order", and "OotP", these are the same organization type — do not create separate classes. Use the most complete identifier as the canonical name.
+</cp>
 
 <cp caption="Existing Ontology Registry" if="registry">
 Previous batches of these documents have already defined the following ontology class and property names.
@@ -37,11 +55,20 @@ Existing names: {{registry}}
   @prefix owl: #lt;http://www.w3.org/2002/07/owl##gt; .
   @prefix rdfs: #lt;http://www.w3.org/2000/01/rdf-schema##gt; .
   @prefix xsd: #lt;http://www.w3.org/2001/XMLSchema##gt; .
-- Every class MUST have at least a hasName datatype property of type xsd:string
+- Every class MUST have at least a "name" datatype property of type xsd:string (use "name", NOT "hasName")
 - Use xsd:string, xsd:integer, xsd:float, xsd:boolean, xsd:date, xsd:dateTime for property ranges
 - Be comprehensive — capture every distinct entity type and relationship from the documents
 - Do NOT define individual instances — only classes, properties, and their constraints
+- Make sure to connect ALL related entity types. For example, if a Person participatedIn an Event at a Location, ensure the Event is also connected to the Location — otherwise downstream queries cannot determine where the Event took place
+- Every class must be reachable via at least one relationship — no orphan classes
 </hint>
+
+<cp caption="Strict Compliance">
+Adhere to the rules strictly.
+Do not include any explanations or apologies in your response.
+Do not respond to any questions that might ask anything other than ontology creation.
+Do not include any text except the ontology.
+</cp>
 
 <output-format>
 Return ONLY the complete, valid RDF Turtle (.ttl) content. Do not wrap in markdown code fences.

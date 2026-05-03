@@ -2,14 +2,12 @@ import io
 import re
 
 import streamlit as st
-import streamlit.components.v1 as components
 import tiktoken
 from pypdf import PdfReader
 from docx import Document
 from openai import OpenAI
 from rdflib import Graph, RDF, OWL
 from poml import poml
-from pyvis.network import Network
 from loguru import logger
 
 from config import (
@@ -25,11 +23,19 @@ from graph import (
     Neo4jClient,
     ontology_to_schema,
     build_knowledge_graph,
+    enrich_relationships,
+    normalize_entity_names,
     query_graph_rag,
     get_graph_stats,
     find_duplicate_entities,
     has_any_entities,
     compute_edge_weights,
+    create_evidence_layer,
+    create_web_evidence,
+    aggregate_evidence,
+    enrich_temporal,
+    get_evidence_stats,
+    clear_evidence_layer,
 )
 from entity_resolution import (
     find_candidate_pairs,
@@ -316,21 +322,17 @@ def run_pipeline(uploaded_files, gen_model: str, val_model: str, refine: bool, s
     if refine:
         status.update(label=f"Step 1b: Refining ontology ({gen_model})...")
         doc_text = build_document_block(docs)
-        additions = call_prompt_1b(client, gen_model, doc_text, ttl_string)
+        refined = call_prompt_1b(client, gen_model, doc_text, ttl_string)
 
-        if additions.strip().upper() == "NO_ADDITIONS_NEEDED":
-            st.info("Step 1b: No additional types needed — ontology is comprehensive.")
+        if refined.strip().upper() == "NO_ADDITIONS_NEEDED":
+            st.info("Step 1b: Ontology already comprehensive — no changes needed.")
         else:
-            additions_valid, additions_result = validate_ttl(additions)
-            if additions_valid:
-                try:
-                    ttl_string = merge_ttl_fragments([ttl_string, additions_result])
-                    st.success("Step 1b complete: Merged new entity/relationship types.")
-                except Exception as e:
-                    logger.warning(f"Merge failed: {e}. Skipping refinement additions.")
-                    st.warning("Step 1b: Could not merge additions. Proceeding with initial ontology.")
+            refined_valid, refined_result = validate_ttl(refined)
+            if refined_valid:
+                ttl_string = refined_result
+                st.success("Step 1b complete: Ontology refined and corrected.")
             else:
-                logger.warning(f"Refinement additions had invalid TTL: {additions_result}")
+                logger.warning(f"Refinement produced invalid TTL: {refined_result}")
                 st.warning("Step 1b: Refinement output had syntax issues. Proceeding with initial ontology.")
     else:
         st.info("Step 1b: Refinement skipped.")
@@ -389,7 +391,7 @@ def get_ontology_stats(ttl_string: str) -> dict:
 # ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
-def run_kg_pipeline(docs, ttl_string, gen_model, status, alpha=0.1):
+def run_kg_pipeline(docs, ttl_string, gen_model, status, alpha=0.1, chunk_size=1000, chunk_overlap=250):
     try:
         neo4j_client = Neo4jClient()
         driver = neo4j_client()
@@ -417,13 +419,41 @@ def run_kg_pipeline(docs, ttl_string, gen_model, status, alpha=0.1):
         def on_doc_complete(done, total, name):
             progress.progress(done / total, text=f"Document {done}/{total}: {name}")
 
-        build_knowledge_graph(driver, schema, docs, gen_model, on_complete=on_doc_complete)
+        build_knowledge_graph(driver, schema, docs, gen_model, on_complete=on_doc_complete,
+                              chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+        # ── Normalize property names (hasName → name safety net) ──
+        norm_stats = normalize_entity_names(driver)
+        if norm_stats["fixed"]:
+            st.info(f"Normalized {norm_stats['fixed']} entity names (hasName → name)")
         st.success("Entity extraction and KG construction complete.")
+
+        # ── Enrich relationships ──
+        status.update(label="Enriching relationships (re-scanning chunks)...")
+        enrich_progress = st.progress(0, text="Scanning chunks for missing relationships...")
+
+        def on_enrich_progress(done, total):
+            enrich_progress.progress(done / total, text=f"Chunk {done}/{total}")
+
+        enrich_stats = enrich_relationships(driver, schema, model=gen_model, on_progress=on_enrich_progress)
+        st.success(f"Relationship enrichment: **{enrich_stats['created']}** relationships found across **{enrich_stats['chunks_processed']}** chunks")
 
         # ── Compute edge weights ──
         status.update(label="Computing edge weights...")
         weight_stats = compute_edge_weights(driver, alpha=alpha)
         st.success(f"Edge weights computed: **{weight_stats['updated']}** relationships (max shared chunks: {weight_stats['max_shared']}, α={alpha})")
+
+        # ── Create evidence layer ──
+        status.update(label="Creating contextual evidence layer...")
+        ev_stats = create_evidence_layer(driver)
+        st.success(f"Evidence layer: **{ev_stats['created']}** evidence nodes created")
+
+        # ── Aggregate confidence ──
+        status.update(label="Aggregating confidence scores...")
+        agg_stats = aggregate_evidence(driver)
+        st.success(f"Confidence aggregated: **{agg_stats['updated']}** relationships scored")
+
+        st.session_state["evidence_ready"] = True
 
         # ── Snapshot after build ──
         stats_after = get_graph_stats(driver)
@@ -469,6 +499,12 @@ def main():
         st.divider()
         alpha = st.slider("Edge Weight Floor (α)", min_value=0.0, max_value=0.5, value=0.1, step=0.05,
                           help="Minimum weight for any relationship. Higher = less contrast between weak and strong edges.")
+        st.divider()
+        st.header("Extraction")
+        chunk_size = st.slider("Chunk Size (tokens)", min_value=500, max_value=3000, value=1000, step=100,
+                               help="Smaller chunks = more focused extraction = more relationships found")
+        chunk_overlap = st.slider("Chunk Overlap (tokens)", min_value=50, max_value=500, value=250, step=50,
+                                  help="Overlap between chunks to preserve context at boundaries")
         st.divider()
         st.header("Knowledge Graph"
         )
@@ -529,7 +565,8 @@ def main():
 
         if st.button("Build Knowledge Graph", type="primary"):
             with st.status("Building Knowledge Graph...", expanded=True) as kg_status:
-                run_kg_pipeline(docs, ttl_result, gen_model, kg_status, alpha=alpha)
+                run_kg_pipeline(docs, ttl_result, gen_model, kg_status, alpha=alpha,
+                                chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
     # ── Overlap Dashboard ──
     kg_stats = st.session_state.get("kg_stats")
@@ -565,35 +602,31 @@ def main():
     # ── Entity Resolution ──
     run_entity_resolution_section()
 
+    # ── Contextual Evidence ──
+    run_contextual_enrichment_section(gen_model)
+
     # ── External Web Sources ──
     run_web_sources_section(gen_model)
 
-    # ── Graph Visualization ──
-    st.divider()
-    run_graph_visualization()
-
-    # ── Step 3: Ask Questions ──
-    st.divider()
-    run_chat_section(gen_model)
+    # ── Floating Chatbot ──
+    run_floating_chatbot(gen_model)
 
 
 CONFIDENCE_COLORS = {"high": "#2ecc71", "medium": "#f39c12", "low": "#e74c3c", "error": "#95a5a6"}
 
 
 def run_entity_resolution_section():
-    st.divider()
-    st.header("Entity Resolution")
-
     try:
         neo4j_client = Neo4jClient()
         driver = neo4j_client()
         if not has_any_entities(driver):
-            st.info("No entities in graph. Build a Knowledge Graph first.")
             neo4j_client.close()
             return
     except Exception:
-        st.warning("Could not connect to Neo4j.")
         return
+
+    st.divider()
+    st.header("Entity Resolution")
 
     # ── Scoring controls ──
     st.subheader("1. Find & Score Candidates")
@@ -601,9 +634,9 @@ def run_entity_resolution_section():
     with score_col1:
         scoring_level = st.radio(
             "Scoring level",
-            ["Exact match (free)", "Exact + Embedding ($)", "Exact + Embedding + LLM ($$)"],
+            ["Exact match", "Exact + Embedding", "Exact + Embedding + LLM"],
             index=0,
-            help="Higher levels cost more but catch fuzzy duplicates",
+            help="Higher levels catch more fuzzy duplicates",
         )
     with score_col2:
         llm_model = st.selectbox("LLM Judge Model", ["gpt-4o-mini", "gpt-4o"], index=0,
@@ -625,12 +658,12 @@ def run_entity_resolution_section():
         scored = [score_exact(p) for p in all_pairs]
 
         # Level 2: Embedding
-        if scoring_level in ("Exact + Embedding ($)", "Exact + Embedding + LLM ($$)"):
+        if scoring_level in ("Exact + Embedding", "Exact + Embedding + LLM"):
             with st.spinner("Computing embedding similarity..."):
                 scored = score_embedding_batch(all_pairs)
 
         # Level 3: LLM judge (only for ambiguous pairs)
-        if scoring_level == "Exact + Embedding + LLM ($$)":
+        if scoring_level == "Exact + Embedding + LLM":
             ambiguous = [s for s in scored if s["confidence"] in ("medium", "low")]
             if ambiguous:
                 with st.spinner(f"LLM judging {len(ambiguous)} ambiguous pairs..."):
@@ -751,6 +784,98 @@ def run_entity_resolution_section():
     neo4j_client.close()
 
 
+def run_contextual_enrichment_section(gen_model: str):
+    st.divider()
+    st.header("Contextual Evidence Layer")
+    st.caption("Enterprise-style provenance, confidence, and temporal metadata on every relationship")
+
+    if not st.session_state.get("evidence_ready"):
+        st.info("Build a Knowledge Graph first — the evidence layer is created automatically.")
+        return
+
+    try:
+        neo4j_client = Neo4jClient()
+        driver = neo4j_client()
+        if not has_any_entities(driver):
+            st.info("No entities in graph. Build a Knowledge Graph first.")
+            neo4j_client.close()
+            return
+    except Exception:
+        st.warning("Could not connect to Neo4j.")
+        return
+
+    # ── Evidence dashboard ──
+    try:
+        stats = get_evidence_stats(driver)
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Evidence Nodes", stats["total_evidence"])
+        col2.metric("Avg Confidence", f"{stats['avg_confidence']:.3f}")
+        col3.metric("Temporal Enriched", stats["temporal_enriched"])
+        col4.metric("Relationships Scored", stats["relationships_scored"])
+
+        if stats["by_source_type"]:
+            with st.expander("Evidence by source type"):
+                for src_type, cnt in stats["by_source_type"].items():
+                    st.markdown(f"- **{src_type}**: {cnt} nodes")
+    except Exception as e:
+        logger.warning(f"Could not load evidence stats: {e}")
+
+    # ── Temporal enrichment (LLM cost) ──
+    st.subheader("Temporal Enrichment")
+    st.caption("Use LLM to determine when each relationship was valid (costs API tokens)")
+
+    tcol1, tcol2 = st.columns(2)
+    with tcol1:
+        temporal_model = st.selectbox("Temporal Model", ["gpt-4o-mini", "gpt-4o"], index=0,
+                                       key="temporal_model")
+    with tcol2:
+        temporal_batch = st.slider("Batch size", 5, 30, 15, key="temporal_batch",
+                                    help="Relationships per LLM call")
+
+    if st.button("Run Temporal Enrichment", type="primary", key="btn_temporal"):
+        with st.status("Enriching temporal metadata...", expanded=True) as t_status:
+            progress = st.progress(0, text="Processing batches...")
+
+            def on_temporal_progress(done, total):
+                progress.progress(done / total, text=f"Batch {done}/{total}")
+
+            result = enrich_temporal(driver, model=temporal_model,
+                                     batch_size=temporal_batch,
+                                     on_progress=on_temporal_progress)
+            st.success(f"Temporal enrichment: **{result['updated']}** evidence nodes updated across **{result['batches']}** batches")
+
+            t_status.update(label="Re-aggregating confidence with temporal data...")
+            aggregate_evidence(driver)
+            t_status.update(label="Done!", state="complete")
+
+    # ── Web evidence (after web sources are fetched) ──
+    if st.session_state.get("web_sources_enabled"):
+        st.subheader("Web Evidence")
+        if st.button("Add Web Evidence", key="btn_web_evidence"):
+            with st.spinner("Creating evidence from web sources..."):
+                web_ev = create_web_evidence(driver)
+                st.success(f"Web evidence: **{web_ev['created']}** evidence nodes created")
+                aggregate_evidence(driver)
+                st.success("Confidence re-aggregated with web evidence.")
+
+    # ── Maintenance ──
+    with st.expander("Maintenance"):
+        mcol1, mcol2 = st.columns(2)
+        with mcol1:
+            if st.button("Re-aggregate Confidence", key="btn_reagg"):
+                with st.spinner("Aggregating..."):
+                    result = aggregate_evidence(driver)
+                    st.success(f"Re-aggregated: {result['updated']} relationships")
+        with mcol2:
+            if st.button("Clear Evidence Layer", type="secondary", key="btn_clear_ev"):
+                with st.spinner("Clearing..."):
+                    result = clear_evidence_layer(driver)
+                    st.success(f"Cleared: {result['deleted']} evidence nodes removed")
+                    st.session_state["evidence_ready"] = False
+
+    neo4j_client.close()
+
+
 def run_web_sources_section(gen_model: str):
     st.divider()
     st.header("External Web Sources")
@@ -851,198 +976,76 @@ def run_web_sources_section(gen_model: str):
     neo4j_client.close()
 
 
-COLOR_PALETTE = [
-    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
-    "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
-    "#86bcb6", "#8cd17d", "#a0cbe8", "#d4a6c8", "#ffbe7d",
-    "#d7b5a6", "#b6992d", "#ff6b6b", "#4ecdc4", "#45b7d1",
-]
-
-
-def run_graph_visualization():
-    st.header("Graph Visualization")
-
-    try:
-        neo4j_client = Neo4jClient()
-        driver = neo4j_client()
-        if not has_any_entities(driver):
-            st.info("No graph to visualize. Build a Knowledge Graph first.")
-            neo4j_client.close()
-            return
-    except Exception:
-        st.warning("Could not connect to Neo4j.")
-        return
-
-    node_limit = st.slider("Max nodes", min_value=20, max_value=500, value=100, step=20, key="viz_limit")
-
-    if st.button("Visualize Graph"):
-        with st.spinner("Loading graph..."):
-            try:
-                html, legend = build_graph_html(driver, node_limit)
-                if legend:
-                    cols = st.columns(min(len(legend), 6))
-                    for i, (label, color) in enumerate(legend.items()):
-                        cols[i % len(cols)].markdown(
-                            f'<span style="color:{color}; font-size:20px;">&#9679;</span> {label}',
-                            unsafe_allow_html=True,
-                        )
-                components.html(html, height=700, scrolling=False)
-            except Exception as e:
-                st.error(f"Visualization error: {e}")
-
-    neo4j_client.close()
-
-
-def build_graph_html(driver, limit: int) -> tuple[str, dict]:
-    node_query = """
-    MATCH (n)
-    WHERE n.name IS NOT NULL
-      AND NONE(lbl IN labels(n) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
-    RETURN elementId(n) AS id, n.name AS name, labels(n) AS labels
-    LIMIT $limit
-    """
-    rel_query = """
-    MATCH (a)-[r]->(b)
-    WHERE a.name IS NOT NULL AND b.name IS NOT NULL
-      AND NONE(lbl IN labels(a) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
-      AND NONE(lbl IN labels(b) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
-      AND NOT type(r) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO']
-    WITH a, r, b LIMIT $limit
-    RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS rel_type,
-           coalesce(r.weight, 1.0) AS weight
-    """
-
-    with driver.session() as session:
-        nodes = session.run(node_query, limit=limit).data()
-        rels = session.run(rel_query, limit=limit * 3).data()
-
-    # Count connections per node for sizing
-    degree: dict[str, int] = {}
-    for rel in rels:
-        degree[rel["source"]] = degree.get(rel["source"], 0) + 1
-        degree[rel["target"]] = degree.get(rel["target"], 0) + 1
-
-    # Auto-assign colors to entity types
-    all_types = set()
-    for node in nodes:
-        for lbl in node["labels"]:
-            if lbl not in ("__Entity__", "Document", "Chunk", "WebDocument", "WebChunk"):
-                all_types.add(lbl)
-    type_colors = {}
-    for i, t in enumerate(sorted(all_types)):
-        type_colors[t] = COLOR_PALETTE[i % len(COLOR_PALETTE)]
-
-    net = Network(height="680px", width="100%", bgcolor="#0e1117", font_color="#ffffff")
-    net.barnes_hut(gravity=-5000, central_gravity=0.35, spring_length=200, spring_strength=0.01)
-
-    node_ids = set()
-    for node in nodes:
-        nid = node["id"]
-        node_ids.add(nid)
-        name = node["name"]
-        node_labels = [l for l in node["labels"] if l not in ("__Entity__",)]
-        entity_type = node_labels[0] if node_labels else "Unknown"
-        color = type_colors.get(entity_type, "#aaaaaa")
-        size = 12 + min(degree.get(nid, 0) * 4, 40)
-        short_name = name if len(name) <= 25 else name[:22] + "..."
-
-        net.add_node(
-            nid,
-            label=short_name,
-            title=f"<b>{entity_type}</b><br>{name}<br>Connections: {degree.get(nid, 0)}",
-            color=color,
-            size=size,
-            font={"size": 11, "color": "#ffffff", "strokeWidth": 2, "strokeColor": "#000000"},
-        )
-
-    for rel in rels:
-        if rel["source"] in node_ids and rel["target"] in node_ids:
-            w = rel.get("weight", 1.0)
-            edge_width = 0.5 + w * 3.0
-            opacity = max(0.3, w)
-            net.add_edge(
-                rel["source"],
-                rel["target"],
-                title=f'{rel["rel_type"]} (weight: {w:.2f})',
-                label=rel["rel_type"],
-                color={"color": f"rgba(85,85,85,{opacity})", "highlight": "#ffffff"},
-                font={"size": 8, "color": "#aaaaaa", "strokeWidth": 0},
-                arrows="to",
-                width=edge_width,
-            )
-
-    return net.generate_html(), type_colors
-
-
-def run_chat_section(gen_model: str):
-    st.header("Step 3: Ask Questions (GraphRAG)")
-
-    try:
-        neo4j_client = Neo4jClient()
-        driver = neo4j_client()
-        has_data = has_any_entities(driver)
-        neo4j_client.close()
-    except Exception:
-        st.warning("Could not connect to Neo4j. Build a Knowledge Graph first.")
-        return
-
-    if not has_data:
-        st.info("No entities found in the graph. Build a Knowledge Graph first.")
-        return
-
-    ret_col1, ret_col2, ret_col3 = st.columns(3)
-    with ret_col1:
-        hops = st.select_slider("Reasoning hops", options=[1, 2], value=2,
-                                help="1 = direct relationships only. 2 = multi-hop reasoning (follows neighbor's neighbors).")
-    with ret_col2:
-        weight_threshold = st.slider("Weight threshold", min_value=0.0, max_value=0.5, value=0.1, step=0.05,
-                                     help="Ignore edges below this weight during retrieval.")
-    with ret_col3:
-        web_available = st.session_state.get("web_sources_enabled", False)
-        include_web = st.checkbox("Include web sources", value=False,
-                                  disabled=not web_available,
-                                  help="Follow SIMILAR_TO edges to include supplementary web context" if web_available
-                                       else "Fetch web sources first to enable this")
-
+def run_floating_chatbot(gen_model: str):
     if "chat_history" not in st.session_state:
         st.session_state["chat_history"] = []
+
+    with st.sidebar:
+        st.divider()
+        st.header("GraphRAG Chat")
+        web_available = st.session_state.get("web_sources_enabled", False)
+        include_web = st.checkbox("Include web sources", value=False, key="chat_web",
+                                  disabled=not web_available)
+        if st.button("Clear chat", key="btn_clear_chat"):
+            st.session_state["chat_history"] = []
+            st.rerun()
 
     for msg in st.session_state["chat_history"]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            if msg.get("context_items"):
+                with st.expander("Retrieved context"):
+                    for ci in msg["context_items"]:
+                        st.markdown(f"**Chunk {ci['index']}** (score: {ci['score']})")
+                        st.text(ci["text"])
+                        st.divider()
 
     question = st.chat_input("Ask a question about your knowledge graph...")
 
     if question:
         st.session_state["chat_history"].append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.markdown(question)
 
-        with st.chat_message("assistant"):
+        try:
+            neo4j_client = Neo4jClient()
+            driver = neo4j_client()
+
+            if not has_any_entities(driver):
+                answer = "No knowledge graph found. Please build one first."
+                st.session_state["chat_history"].append({"role": "assistant", "content": answer})
+                neo4j_client.close()
+                st.rerun()
+                return
+
             with st.spinner("Searching knowledge graph..."):
-                try:
-                    neo4j_client = Neo4jClient()
-                    driver = neo4j_client()
-                    result = query_graph_rag(driver, question, gen_model,
-                                            hops=hops, weight_threshold=weight_threshold,
-                                            include_web_sources=include_web)
-                    neo4j_client.close()
+                result = query_graph_rag(
+                    driver, question, gen_model,
+                    hops=2,
+                    weight_threshold=0.1,
+                    confidence_threshold=0.0,
+                    include_web_sources=include_web,
+                )
+            neo4j_client.close()
 
-                    answer = result["answer"]
-                    st.markdown(answer)
-                    st.session_state["chat_history"].append({"role": "assistant", "content": answer})
+            answer = result["answer"]
+            context_items = []
+            if result["context"] and result["context"].items:
+                for i, item in enumerate(result["context"].items, 1):
+                    content_str = str(item.content)
+                    score_match = re.search(r'score=([\d.]+)', content_str)
+                    score_val = f"{float(score_match.group(1)):.4f}" if score_match else "N/A"
+                    context_items.append({"index": i, "score": score_val, "text": content_str[:500]})
 
-                    if result["context"] and result["context"].items:
-                        with st.expander("Retrieved context"):
-                            for i, item in enumerate(result["context"].items, 1):
-                                st.markdown(f"**Chunk {i}** (score: {item.metadata.get('score', 'N/A') if item.metadata else 'N/A'})")
-                                st.text(str(item.content)[:500])
-                                st.divider()
+            st.session_state["chat_history"].append({
+                "role": "assistant",
+                "content": answer,
+                "context_items": context_items,
+            })
+            st.rerun()
 
-                except Exception as e:
-                    error_msg = f"Error querying graph: {e}"
-                    st.error(error_msg)
-                    st.session_state["chat_history"].append({"role": "assistant", "content": error_msg})
+        except Exception as e:
+            error_msg = f"Error querying graph: {e}"
+            st.session_state["chat_history"].append({"role": "assistant", "content": error_msg})
+            st.rerun()
 
 
 if __name__ == "__main__":

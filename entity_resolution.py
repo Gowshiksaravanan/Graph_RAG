@@ -19,10 +19,10 @@ def find_candidate_pairs(driver: Driver) -> dict:
       AND NONE(lbl IN labels(b) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
       AND toLower(trim(a.name)) = toLower(trim(b.name))
       AND elementId(a) < elementId(b)
-      AND ANY(lbl IN labels(a) WHERE lbl IN [x IN labels(b) WHERE x <> '__Entity__'])
+      AND ANY(lbl IN labels(a) WHERE NOT lbl IN ['__Entity__', '__KGBuilder__'] AND lbl IN [x IN labels(b) WHERE NOT x IN ['__Entity__', '__KGBuilder__']])
     WITH a, b,
-         [lbl IN labels(a) WHERE lbl <> '__Entity__'][0] AS label_a,
-         [lbl IN labels(b) WHERE lbl <> '__Entity__'][0] AS label_b
+         [lbl IN labels(a) WHERE NOT lbl IN ['__Entity__', '__KGBuilder__']][0] AS label_a,
+         [lbl IN labels(b) WHERE NOT lbl IN ['__Entity__', '__KGBuilder__']][0] AS label_b
     RETURN a.name AS name,
            label_a,
            label_b,
@@ -39,10 +39,10 @@ def find_candidate_pairs(driver: Driver) -> dict:
       AND NONE(lbl IN labels(b) WHERE lbl IN ['Document', 'Chunk', 'WebDocument', 'WebChunk'])
       AND toLower(trim(a.name)) = toLower(trim(b.name))
       AND elementId(a) < elementId(b)
-      AND NONE(lbl IN labels(a) WHERE lbl <> '__Entity__' AND lbl IN [x IN labels(b) WHERE x <> '__Entity__'])
+      AND NONE(lbl IN labels(a) WHERE NOT lbl IN ['__Entity__', '__KGBuilder__'] AND lbl IN [x IN labels(b) WHERE NOT x IN ['__Entity__', '__KGBuilder__']])
     WITH a, b,
-         [lbl IN labels(a) WHERE lbl <> '__Entity__'][0] AS label_a,
-         [lbl IN labels(b) WHERE lbl <> '__Entity__'][0] AS label_b
+         [lbl IN labels(a) WHERE NOT lbl IN ['__Entity__', '__KGBuilder__']][0] AS label_a,
+         [lbl IN labels(b) WHERE NOT lbl IN ['__Entity__', '__KGBuilder__']][0] AS label_b
     RETURN a.name AS name,
            label_a,
            label_b,
@@ -139,7 +139,7 @@ def score_embedding_batch(pairs: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Scoring — Level 3: LLM judge
 # ---------------------------------------------------------------------------
-LLM_JUDGE_PROMPT = """You are an entity resolution expert. Determine if these two entities from a knowledge graph refer to the same real-world entity.
+LLM_JUDGE_PROMPT = """You are an entity resolution expert for knowledge graphs. Determine if these two entities refer to the same real-world entity.
 
 Entity A:
 - Type: {label_a}
@@ -150,6 +150,16 @@ Entity B:
 - Type: {label_b}
 - Name: {name_b}
 - Properties: {props_b}
+
+Consider these coreference patterns when deciding:
+- Abbreviations or acronyms (e.g., "Order of the Phoenix" vs "OotP")
+- Nicknames, titles, or aliases (e.g., "Harry Potter" vs "The Boy Who Lived", "Dr. Karen Osei" vs "Karen Osei")
+- Partial names (e.g., "Harry" vs "Harry Potter", "NovaTech" vs "NovaTech Industries")
+- Same entity with different type labels (e.g., Person vs Character referring to the same individual)
+- Different spellings or transliterations of the same name
+
+If the entities clearly refer to the same real-world thing, merge them using the most complete identifier as the canonical name.
+If they are genuinely different entities that happen to share some properties, keep them separate.
 
 Respond with EXACTLY one of these formats:
 MERGE: <one sentence reason>
@@ -219,8 +229,12 @@ def score_llm_batch(pairs: list[dict], model: str = "gpt-4o-mini") -> list[dict]
 def build_transitive_clusters(approved_pairs: list[dict], max_cluster_size: int = 5) -> list[list[dict]]:
     parent: dict[str, str] = {}
 
+    for pair in approved_pairs:
+        parent.setdefault(pair["id_a"], pair["id_a"])
+        parent.setdefault(pair["id_b"], pair["id_b"])
+
     def find(x):
-        while parent.get(x, x) != x:
+        while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
