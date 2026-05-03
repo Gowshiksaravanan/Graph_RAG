@@ -1,10 +1,9 @@
 import asyncio
+import concurrent.futures
 import json
 import os
-import sys
 
 import certifi
-import nest_asyncio
 from loguru import logger
 from neo4j import GraphDatabase, Driver
 from openai import OpenAI
@@ -43,13 +42,13 @@ _INFRA_LABELS = [
     'Document', 'Chunk', 'WebDocument', 'WebChunk', 'Evidence',
 ]
 
-if sys.version_info < (3, 14):
-    nest_asyncio.apply()
-else:
+def _run_async(coro):
     try:
-        nest_asyncio.apply()
-    except Exception:
-        logger.warning("nest_asyncio.apply() failed — skipping (Python 3.14+)")
+        asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    except RuntimeError:
+        return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +238,7 @@ def build_knowledge_graph(
 
     for i, doc in enumerate(documents):
         logger.info(f"Processing document {i + 1}/{len(documents)}: {doc['name']}")
-        asyncio.run(kg_builder.run_async(text=doc["text"]))
+        _run_async(kg_builder.run_async(text=doc["text"]))
         if on_complete:
             on_complete(i + 1, len(documents), doc["name"])
 
