@@ -48,7 +48,11 @@ from entity_resolution import (
     undo_merge,
     find_orphaned_nodes,
 )
-from evaluation import generate_testset, run_evaluation, compute_summary
+try:
+    from evaluation import generate_testset, run_evaluation, compute_summary
+    EVAL_AVAILABLE = True
+except ImportError:
+    EVAL_AVAILABLE = False
 from web_sources import (
     extract_topics,
     search_and_fetch,
@@ -638,6 +642,10 @@ def _run_kg_tab():
 
 
 def run_evaluation_tab():
+    if not EVAL_AVAILABLE:
+        st.error("Evaluation requires `ragas` and `langchain-openai` packages. "
+                 "Install with: `pip install ragas langchain-openai`")
+        return
     st.caption("Evaluate your Knowledge Graph with RAGAS metrics + hop efficiency")
 
     model_names = list(KNOWN_MODEL_LIMITS.keys())
