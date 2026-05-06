@@ -1,5 +1,6 @@
 import re
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
 from ragas import evaluate, EvaluationDataset
 from ragas.metrics import (
@@ -16,6 +17,12 @@ from langchain_core.documents import Document as LCDocument
 
 from config import OPENAI_API_KEY
 from graph import Neo4jClient, query_graph_rag, has_any_entities
+
+
+def _run_in_thread(fn, *args, **kwargs):
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fn, *args, **kwargs)
+        return future.result()
 
 
 def _extract_hops(context_items: list[dict]) -> int:
@@ -53,7 +60,7 @@ def generate_testset(texts: list[str], model: str = "gpt-4o", testset_size: int 
     ]
 
     generator = TestsetGenerator(llm=llm, embedding_model=embeddings)
-    dataset = generator.generate_with_langchain_docs(lc_docs, testset_size=testset_size)
+    dataset = _run_in_thread(generator.generate_with_langchain_docs, lc_docs, testset_size=testset_size)
     df = dataset.to_pandas()
 
     logger.info(f"RAGAS testset columns: {list(df.columns)}")
@@ -127,7 +134,8 @@ def run_evaluation(
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
     evaluator_llm = LangchainLLMWrapper(ChatOpenAI(model=model, openai_api_key=OPENAI_API_KEY))
 
-    ragas_results = evaluate(
+    ragas_results = _run_in_thread(
+        evaluate,
         dataset=dataset,
         metrics=[Faithfulness(), AnswerRelevancy(), ContextPrecision(), ContextRecall()],
         llm=evaluator_llm,
