@@ -35,7 +35,6 @@ from graph import (
     create_evidence_layer,
     create_web_evidence,
     aggregate_evidence,
-    enrich_temporal,
     get_evidence_stats,
     clear_evidence_layer,
 )
@@ -818,7 +817,7 @@ def run_entity_resolution_section():
 def run_contextual_enrichment_section(gen_model: str):
     st.divider()
     st.header("Contextual Evidence Layer")
-    st.caption("Enterprise-style provenance, confidence, and temporal metadata on every relationship")
+    st.caption("Enterprise-style provenance and confidence on every relationship")
 
     if not st.session_state.get("evidence_ready"):
         st.info("Build a Knowledge Graph first — the evidence layer is created automatically.")
@@ -838,11 +837,10 @@ def run_contextual_enrichment_section(gen_model: str):
     # ── Evidence dashboard ──
     try:
         stats = get_evidence_stats(driver)
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3 = st.columns(3)
         col1.metric("Evidence Nodes", stats["total_evidence"])
         col2.metric("Avg Confidence", f"{stats['avg_confidence']:.3f}")
-        col3.metric("Temporal Enriched", stats["temporal_enriched"])
-        col4.metric("Relationships Scored", stats["relationships_scored"])
+        col3.metric("Relationships Scored", stats["relationships_scored"])
 
         if stats["by_source_type"]:
             with st.expander("Evidence by source type"):
@@ -850,34 +848,6 @@ def run_contextual_enrichment_section(gen_model: str):
                     st.markdown(f"- **{src_type}**: {cnt} nodes")
     except Exception as e:
         logger.warning(f"Could not load evidence stats: {e}")
-
-    # ── Temporal enrichment (LLM cost) ──
-    st.subheader("Temporal Enrichment")
-    st.caption("Use LLM to determine when each relationship was valid (costs API tokens)")
-
-    tcol1, tcol2 = st.columns(2)
-    with tcol1:
-        temporal_model = st.selectbox("Temporal Model", ["gpt-4o-mini", "gpt-4o"], index=0,
-                                       key="temporal_model")
-    with tcol2:
-        temporal_batch = st.slider("Batch size", 5, 30, 15, key="temporal_batch",
-                                    help="Relationships per LLM call")
-
-    if st.button("Run Temporal Enrichment", type="primary", key="btn_temporal"):
-        with st.status("Enriching temporal metadata...", expanded=True) as t_status:
-            progress = st.progress(0, text="Processing batches...")
-
-            def on_temporal_progress(done, total):
-                progress.progress(done / total, text=f"Batch {done}/{total}")
-
-            result = enrich_temporal(driver, model=temporal_model,
-                                     batch_size=temporal_batch,
-                                     on_progress=on_temporal_progress)
-            st.success(f"Temporal enrichment: **{result['updated']}** evidence nodes updated across **{result['batches']}** batches")
-
-            t_status.update(label="Re-aggregating confidence with temporal data...")
-            aggregate_evidence(driver)
-            t_status.update(label="Done!", state="complete")
 
     # ── Web evidence (after web sources are fetched) ──
     if st.session_state.get("web_sources_enabled"):
