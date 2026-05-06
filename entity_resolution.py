@@ -178,9 +178,9 @@ def score_llm_batch(pairs: list[dict], model: str = "gpt-4o-mini") -> list[dict]
         props_b = {k: v for k, v in pair["props_b"].items() if k not in ("embedding",)}
 
         prompt = LLM_JUDGE_PROMPT.format(
-            label_a=pair["label_a"], name_a=pair["name"],
+            label_a=pair["label_a"], name_a=pair.get("props_a", {}).get("name", pair["name"]),
             props_a=props_a,
-            label_b=pair["label_b"], name_b=pair["name"],
+            label_b=pair["label_b"], name_b=pair.get("props_b", {}).get("name", pair["name"]),
             props_b=props_b,
         )
 
@@ -261,12 +261,12 @@ def build_transitive_clusters(approved_pairs: list[dict], max_cluster_size: int 
     for pair in approved_pairs:
         if pair["id_a"] not in id_to_info:
             id_to_info[pair["id_a"]] = {
-                "id": pair["id_a"], "name": pair["name"],
+                "id": pair["id_a"], "name": pair.get("props_a", {}).get("name", pair["name"]),
                 "label": pair["label_a"], "props": pair["props_a"],
             }
         if pair["id_b"] not in id_to_info:
             id_to_info[pair["id_b"]] = {
-                "id": pair["id_b"], "name": pair["name"],
+                "id": pair["id_b"], "name": pair.get("props_b", {}).get("name", pair["name"]),
                 "label": pair["label_b"], "props": pair["props_b"],
             }
 

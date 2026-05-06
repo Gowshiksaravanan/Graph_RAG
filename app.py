@@ -708,7 +708,9 @@ def run_entity_resolution_section():
 
         for i, pair in enumerate(sorted_pairs):
             color = CONFIDENCE_COLORS.get(pair["confidence"], "#aaa")
-            col_check, col_info, col_detail = st.columns([0.5, 3, 4])
+            name_a = pair.get("props_a", {}).get("name", pair["name"])
+            name_b = pair.get("props_b", {}).get("name", pair["name"])
+            col_check, col_info, col_detail = st.columns([0.5, 4, 4])
 
             with col_check:
                 st.session_state["er_approvals"][i] = st.checkbox(
@@ -719,14 +721,26 @@ def run_entity_resolution_section():
             with col_info:
                 st.markdown(
                     f'<span style="color:{color}; font-weight:bold;">{pair["confidence"].upper()}</span> '
-                    f'({pair["score_type"]}: {pair["score"]:.2f})  **{pair["name"]}**',
+                    f'({pair["score_type"]}: {pair["score"]:.2f})<br>'
+                    f'&nbsp;&nbsp;**A:** {name_a} `{pair["label_a"]}`<br>'
+                    f'&nbsp;&nbsp;**B:** {name_b} `{pair["label_b"]}`',
                     unsafe_allow_html=True,
                 )
 
             with col_detail:
-                type_info = (f'{pair["label_a"]}' if pair["label_a"] == pair["label_b"]
-                             else f'{pair["label_a"]} vs {pair["label_b"]}')
-                st.caption(f'{type_info} — {pair["reason"]}')
+                st.caption(pair["reason"])
+                props_a = {k: v for k, v in pair.get("props_a", {}).items() if k not in ("name", "embedding") and v}
+                props_b = {k: v for k, v in pair.get("props_b", {}).items() if k not in ("name", "embedding") and v}
+                if props_a or props_b:
+                    diff_keys = set(props_a.keys()) ^ set(props_b.keys())
+                    val_diffs = {k for k in set(props_a.keys()) & set(props_b.keys()) if props_a[k] != props_b[k]}
+                    if diff_keys or val_diffs:
+                        diffs = []
+                        for k in sorted(diff_keys | val_diffs):
+                            va = props_a.get(k, "—")
+                            vb = props_b.get(k, "—")
+                            diffs.append(f"`{k}`: {va} vs {vb}")
+                        st.caption("Diffs: " + " · ".join(diffs))
 
         approved = [sorted_pairs[i] for i, checked in st.session_state["er_approvals"].items() if checked]
         st.info(f"**{len(approved)}** of **{len(sorted_pairs)}** pairs approved for merge.")
@@ -875,21 +889,6 @@ def run_contextual_enrichment_section(gen_model: str):
                 aggregate_evidence(driver)
                 st.success("Confidence re-aggregated with web evidence.")
 
-    # ── Maintenance ──
-    with st.expander("Maintenance"):
-        mcol1, mcol2 = st.columns(2)
-        with mcol1:
-            if st.button("Re-aggregate Confidence", key="btn_reagg"):
-                with st.spinner("Aggregating..."):
-                    result = aggregate_evidence(driver)
-                    st.success(f"Re-aggregated: {result['updated']} relationships")
-        with mcol2:
-            if st.button("Clear Evidence Layer", type="secondary", key="btn_clear_ev"):
-                with st.spinner("Clearing..."):
-                    result = clear_evidence_layer(driver)
-                    st.success(f"Cleared: {result['deleted']} evidence nodes removed")
-                    st.session_state["evidence_ready"] = False
-
     neo4j_client.close()
 
 
@@ -1017,7 +1016,7 @@ def run_floating_chatbot(gen_model: str):
                         st.text(ci["text"])
                         st.divider()
 
-    question = st.chat_input("Ask a question about your knowledge graph...")
+    question = st.chat_input("Ask a question...")
 
     if question:
         st.session_state["chat_history"].append({"role": "user", "content": question})
