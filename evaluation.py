@@ -20,8 +20,18 @@ from graph import Neo4jClient, query_graph_rag, has_any_entities
 
 
 def _run_in_thread(fn, *args, **kwargs):
+    import asyncio
+
+    def _target():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            loop.close()
+
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(fn, *args, **kwargs)
+        future = pool.submit(_target)
         return future.result()
 
 
