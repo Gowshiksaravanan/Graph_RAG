@@ -56,9 +56,20 @@ def generate_testset(texts: list[str], model: str = "gpt-4o", testset_size: int 
     dataset = generator.generate_with_langchain_docs(lc_docs, testset_size=testset_size)
     df = dataset.to_pandas()
 
+    logger.info(f"RAGAS testset columns: {list(df.columns)}")
+    logger.info(f"RAGAS testset shape: {df.shape}")
+    if not df.empty:
+        logger.info(f"RAGAS testset first row: {df.iloc[0].to_dict()}")
+
+    q_col = next((c for c in ["user_input", "question"] if c in df.columns), None)
+    a_col = next((c for c in ["reference", "ground_truth", "reference_answer", "answer"] if c in df.columns), None)
+
+    if q_col is None:
+        raise ValueError(f"RAGAS output has no question column. Columns found: {list(df.columns)}")
+
     result = pd.DataFrame()
-    result["question"] = df.get("user_input", df.get("question", pd.Series()))
-    result["ground_truth"] = df.get("reference", df.get("ground_truth", pd.Series()))
+    result["question"] = df[q_col]
+    result["ground_truth"] = df[a_col] if a_col else "N/A"
     return result
 
 
