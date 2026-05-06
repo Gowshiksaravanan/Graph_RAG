@@ -42,8 +42,10 @@ def _parse_context_items(result: dict) -> tuple[list[str], list[dict]]:
 
 
 def generate_testset(texts: list[str], model: str = "gpt-4o", testset_size: int = 10) -> pd.DataFrame:
-    llm = LangchainLLMWrapper(ChatOpenAI(model=model, api_key=OPENAI_API_KEY))
-    embeddings = LangchainEmbeddingsWrapper(LCOpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY))
+    import os
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    llm = LangchainLLMWrapper(ChatOpenAI(model=model, openai_api_key=OPENAI_API_KEY))
+    embeddings = LangchainEmbeddingsWrapper(LCOpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=OPENAI_API_KEY))
 
     lc_docs = [
         LCDocument(page_content=t, metadata={"source": f"doc_{i}"})
@@ -110,7 +112,9 @@ def run_evaluation(
         })
 
     dataset = EvaluationDataset.from_list(eval_data)
-    evaluator_llm = LangchainLLMWrapper(ChatOpenAI(model=model, api_key=OPENAI_API_KEY))
+    import os
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    evaluator_llm = LangchainLLMWrapper(ChatOpenAI(model=model, openai_api_key=OPENAI_API_KEY))
 
     ragas_results = evaluate(
         dataset=dataset,

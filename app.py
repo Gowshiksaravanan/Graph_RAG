@@ -685,7 +685,9 @@ def run_evaluation_tab():
                         st.session_state["eval_qa_pairs"] = qa_df
                         st.success(f"Generated {len(qa_df)} Q&A pairs.")
                     except Exception as e:
+                        import traceback
                         st.error(f"Failed to generate benchmark: {e}")
+                        st.code(traceback.format_exc())
 
     else:
         csv_file = st.file_uploader(
