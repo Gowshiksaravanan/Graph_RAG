@@ -618,9 +618,6 @@ def main():
     # ── Entity Resolution ──
     run_entity_resolution_section()
 
-    # ── Contextual Evidence ──
-    run_contextual_enrichment_section(gen_model)
-
     # ── External Web Sources ──
     run_web_sources_section(gen_model)
 
