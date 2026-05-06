@@ -9,6 +9,7 @@ from ragas.metrics import (
     ContextRecall,
 )
 from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
 from ragas.testset import TestsetGenerator
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings as LCOpenAIEmbeddings
 from langchain_core.documents import Document as LCDocument
@@ -42,7 +43,7 @@ def _parse_context_items(result: dict) -> tuple[list[str], list[dict]]:
 
 def generate_testset(texts: list[str], model: str = "gpt-4o", testset_size: int = 10) -> pd.DataFrame:
     llm = LangchainLLMWrapper(ChatOpenAI(model=model, api_key=OPENAI_API_KEY))
-    embeddings = LCOpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
+    embeddings = LangchainEmbeddingsWrapper(LCOpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY))
 
     lc_docs = [
         LCDocument(page_content=t, metadata={"source": f"doc_{i}"})
