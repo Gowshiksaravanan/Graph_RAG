@@ -521,6 +521,7 @@ def _run_kg_tab():
     with st.sidebar:
         st.header("Configuration")
         gen_model = st.selectbox("Generation Model", options=model_names, index=0)
+        st.session_state["gen_model"] = gen_model
         val_model = st.selectbox("Syntax Fix Model", options=model_names, index=1,
                                  help="Only used if rdflib detects syntax errors")
         st.divider()
@@ -648,8 +649,7 @@ def run_evaluation_tab():
         return
     st.caption("Evaluate your Knowledge Graph with RAGAS metrics + hop efficiency")
 
-    model_names = list(KNOWN_MODEL_LIMITS.keys())
-    eval_model = st.selectbox("Evaluation Model", options=model_names, index=0, key="eval_model")
+    eval_model = st.session_state.get("gen_model", "gpt-4o")
     eval_max_hops = st.slider("Max Hops", min_value=1, max_value=5, value=3, step=1,
                                key="eval_hops",
                                help="Maximum hop depth for graph traversal during evaluation")
