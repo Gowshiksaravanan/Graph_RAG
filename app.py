@@ -517,9 +517,9 @@ def main():
                           help="Minimum weight for any relationship. Higher = less contrast between weak and strong edges.")
         st.divider()
         st.header("Extraction")
-        chunk_size = st.slider("Chunk Size (tokens)", min_value=500, max_value=3000, value=1000, step=100,
+        chunk_size = st.slider("Chunk Size (tokens)", min_value=500, max_value=3000, value=500, step=100,
                                help="Smaller chunks = more focused extraction = more relationships found")
-        chunk_overlap = st.slider("Chunk Overlap (tokens)", min_value=50, max_value=500, value=250, step=50,
+        chunk_overlap = st.slider("Chunk Overlap (tokens)", min_value=50, max_value=500, value=100, step=50,
                                   help="Overlap between chunks to preserve context at boundaries")
         st.divider()
         st.header("Knowledge Graph"
