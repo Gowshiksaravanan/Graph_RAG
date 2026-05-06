@@ -650,9 +650,7 @@ def run_evaluation_tab():
     st.caption("Evaluate your Knowledge Graph with RAGAS metrics + hop efficiency")
 
     eval_model = st.session_state.get("gen_model", "gpt-4o")
-    eval_max_hops = st.slider("Max Hops", min_value=1, max_value=5, value=3, step=1,
-                               key="eval_hops",
-                               help="Maximum hop depth for graph traversal during evaluation")
+    eval_max_hops = 5
 
     mode = st.radio("Benchmark Source", ["Auto-Generate from Documents", "Upload CSV"],
                     key="eval_mode", horizontal=True)
