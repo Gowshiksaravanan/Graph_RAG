@@ -13,3 +13,5 @@ neo4j>=5.28.0
 neo4j-graphrag>=1.14.1
 certifi>=2024.0.0
 numpy>=1.26.0
+ragas>=0.2.0
+langchain-openai>=0.3.0

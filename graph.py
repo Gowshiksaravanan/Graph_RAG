@@ -947,6 +947,8 @@ def query_graph_rag(
     ct = confidence_threshold
     ws = web_similarity_threshold
 
+    infra_rels = "['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO', 'EVIDENCE_SOURCE', 'EVIDENCE_TARGET']"
+
     web_clause = ""
     web_with = ""
     web_return = ""
@@ -962,75 +964,34 @@ def query_graph_rag(
         )
         web_return = ", web_context"
 
-    ctx_fields = (
-        "+ ' conf:' + toString(coalesce({r}.agg_confidence, 0.5))"
-        "+ ' ev:' + toString(coalesce({r}.evidence_count, 0))"
-        "+ CASE WHEN {r}.valid_from IS NOT NULL THEN ' from:' + {r}.valid_from ELSE '' END"
-        "+ CASE WHEN {r}.valid_to IS NOT NULL THEN ' to:' + {r}.valid_to ELSE '' END"
+    retrieval_query = (
+        "WITH node, score "
+        "OPTIONAL MATCH (entity)-[:FROM_CHUNK]->(node) "
+        f"OPTIONAL MATCH path = (entity)-[*1..{hops}]->(target) "
+        f"WHERE ALL(r IN relationships(path) WHERE NOT type(r) IN {infra_rels} "
+        f"AND coalesce(r.weight, 1.0) >= {wt} "
+        f"AND coalesce(r.agg_confidence, 1.0) >= {ct}) "
+        "AND target <> entity "
+
+        + web_clause +
+
+        "WITH node, score, "
+        "collect(DISTINCT "
+        "reduce(s = '', idx IN range(0, size(relationships(path))-1) | "
+        "s + CASE WHEN idx > 0 THEN ' -> ' ELSE '' END "
+        "+ coalesce(nodes(path)[idx].name, '?') "
+        "+ ' -[' + type(relationships(path)[idx]) "
+        "+ ' w:' + toString(coalesce(relationships(path)[idx].weight, 1.0)) "
+        "+ ' conf:' + toString(coalesce(relationships(path)[idx].agg_confidence, 0.5)) "
+        "+ ']-> ' "
+        "+ CASE WHEN idx = size(relationships(path))-1 THEN coalesce(target.name, '?') ELSE '' END"
+        ")) AS relationships"
+
+        + web_with + " "
+
+        "RETURN node.text AS text, score, relationships"
+        + web_return
     )
-
-    if hops >= 2:
-        retrieval_query = (
-            "WITH node, score "
-            "OPTIONAL MATCH (entity)-[:FROM_CHUNK]->(node) "
-
-            "OPTIONAL MATCH (entity)-[r1]->(hop1) "
-            "WHERE NOT type(r1) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO', 'EVIDENCE_SOURCE', 'EVIDENCE_TARGET'] "
-            f"AND coalesce(r1.weight, 1.0) >= {wt} "
-            f"AND coalesce(r1.agg_confidence, 1.0) >= {ct} "
-
-            "OPTIONAL MATCH (hop1)-[r2]->(hop2) "
-            "WHERE NOT type(r2) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO', 'EVIDENCE_SOURCE', 'EVIDENCE_TARGET'] "
-            f"AND coalesce(r2.weight, 1.0) >= {wt} "
-            f"AND coalesce(r2.agg_confidence, 1.0) >= {ct} "
-            "AND hop2 <> entity "
-
-            + web_clause +
-
-            "WITH node, score, entity, "
-            "collect(DISTINCT coalesce(entity.name, '') + ' -[' + type(r1) "
-            "+ ' w:' + toString(coalesce(r1.weight, 1.0))"
-            + ctx_fields.format(r="r1") +
-            "+ ']-> ' "
-            "+ coalesce(hop1.name, '')) AS hop1_rels, "
-
-            "collect(DISTINCT coalesce(hop1.name, '') + ' -[' + type(r2) "
-            "+ ' w:' + toString(round(coalesce(r1.weight, 1.0) * coalesce(r2.weight, 1.0) * 1000) / 1000)"
-            "+ ' conf:' + toString(round(coalesce(r1.agg_confidence, 0.5) * coalesce(r2.agg_confidence, 0.5) * 1000) / 1000)"
-            "+ ' ev:' + toString(coalesce(r2.evidence_count, 0))"
-            "+ CASE WHEN r2.valid_from IS NOT NULL THEN ' from:' + r2.valid_from ELSE '' END"
-            "+ CASE WHEN r2.valid_to IS NOT NULL THEN ' to:' + r2.valid_to ELSE '' END"
-            "+ ']-> ' + coalesce(hop2.name, '')) AS hop2_rels"
-
-            + web_with + " "
-
-            "RETURN node.text AS text, score, "
-            "hop1_rels + hop2_rels AS relationships"
-            + web_return
-        )
-    else:
-        retrieval_query = (
-            "WITH node, score "
-            "OPTIONAL MATCH (entity)-[:FROM_CHUNK]->(node) "
-            "OPTIONAL MATCH (entity)-[r]->(neighbor) "
-            "WHERE NOT type(r) IN ['FROM_CHUNK', 'FROM_DOCUMENT', 'NEXT_CHUNK', 'SIMILAR_TO', 'EVIDENCE_SOURCE', 'EVIDENCE_TARGET'] "
-            f"AND coalesce(r.weight, 1.0) >= {wt} "
-            f"AND coalesce(r.agg_confidence, 1.0) >= {ct} "
-
-            + web_clause +
-
-            "WITH node, score, "
-            "collect(DISTINCT coalesce(entity.name, '') + ' -[' + type(r) "
-            "+ ' w:' + toString(coalesce(r.weight, 1.0))"
-            + ctx_fields.format(r="r") +
-            "+ ']-> ' "
-            "+ coalesce(neighbor.name, '')) AS relationships"
-
-            + web_with + " "
-
-            "RETURN node.text AS text, score, relationships"
-            + web_return
-        )
 
     embedder = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
 

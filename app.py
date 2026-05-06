@@ -48,6 +48,7 @@ from entity_resolution import (
     undo_merge,
     find_orphaned_nodes,
 )
+from evaluation import generate_testset, run_evaluation, compute_summary
 from web_sources import (
     extract_topics,
     search_and_fetch,
@@ -498,6 +499,17 @@ def run_kg_pipeline(docs, ttl_string, gen_model, status, alpha=0.1, chunk_size=1
 def main():
     st.set_page_config(page_title="Ontology-Driven KG Builder", layout="wide")
     st.title("Ontology-Driven Knowledge Graph Builder")
+
+    tab_kg, tab_eval = st.tabs(["Knowledge Graph Builder", "Evaluation"])
+
+    with tab_eval:
+        run_evaluation_tab()
+
+    with tab_kg:
+        _run_kg_tab()
+
+
+def _run_kg_tab():
     st.caption("Upload documents → Generate ontology → Build Knowledge Graph")
 
     # ── Sidebar ──
@@ -623,6 +635,148 @@ def main():
 
     # ── Floating Chatbot ──
     run_floating_chatbot(gen_model)
+
+
+def run_evaluation_tab():
+    st.caption("Evaluate your Knowledge Graph with RAGAS metrics + hop efficiency")
+
+    model_names = list(KNOWN_MODEL_LIMITS.keys())
+    eval_model = st.selectbox("Evaluation Model", options=model_names, index=0, key="eval_model")
+    eval_max_hops = st.slider("Max Hops", min_value=1, max_value=5, value=3, step=1,
+                               key="eval_hops",
+                               help="Maximum hop depth for graph traversal during evaluation")
+
+    mode = st.radio("Benchmark Source", ["Auto-Generate from Documents", "Upload CSV"],
+                    key="eval_mode", horizontal=True)
+
+    if mode == "Auto-Generate from Documents":
+        eval_files = st.file_uploader(
+            "Upload Source Documents (for Q&A generation)",
+            type=ACCEPTED_FILE_TYPES,
+            accept_multiple_files=True,
+            key="eval_files",
+            help="Upload the original documents to generate benchmark Q&A pairs",
+        )
+
+        num_questions = st.slider("Number of Q&A pairs to generate", min_value=5, max_value=50,
+                                   value=10, step=5, key="eval_num_q")
+
+        if st.button("Generate Benchmark", type="primary", key="btn_gen_bench",
+                      disabled=not eval_files):
+            texts = []
+            for f in eval_files:
+                t = extract_text(f)
+                f.seek(0)
+                if t.strip():
+                    texts.append(t)
+
+            if not texts:
+                st.error("No text could be extracted from the uploaded files.")
+            else:
+                with st.spinner(f"Generating {num_questions} Q&A pairs with RAGAS..."):
+                    try:
+                        qa_df = generate_testset(texts, model=eval_model, testset_size=num_questions)
+                        st.session_state["eval_qa_pairs"] = qa_df
+                        st.success(f"Generated {len(qa_df)} Q&A pairs.")
+                    except Exception as e:
+                        st.error(f"Failed to generate benchmark: {e}")
+
+    else:
+        csv_file = st.file_uploader(
+            "Upload Benchmark CSV (columns: question, ground_truth)",
+            type=["csv"],
+            key="eval_csv",
+        )
+        if csv_file:
+            try:
+                import pandas as pd
+                qa_df = pd.read_csv(csv_file)
+                if "question" not in qa_df.columns or "ground_truth" not in qa_df.columns:
+                    st.error("CSV must have columns: `question` and `ground_truth`")
+                else:
+                    st.session_state["eval_qa_pairs"] = qa_df
+                    st.success(f"Loaded {len(qa_df)} Q&A pairs from CSV.")
+            except Exception as e:
+                st.error(f"Failed to read CSV: {e}")
+
+    qa_pairs = st.session_state.get("eval_qa_pairs")
+    if qa_pairs is not None and not qa_pairs.empty:
+        st.subheader("Benchmark Q&A Pairs")
+        st.dataframe(qa_pairs, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "Download Q&A Pairs as CSV",
+            data=qa_pairs.to_csv(index=False),
+            file_name="benchmark_qa.csv",
+            mime="text/csv",
+            key="dl_qa",
+        )
+
+        if st.button("Run Evaluation", type="primary", key="btn_run_eval"):
+            try:
+                neo4j_client = Neo4jClient()
+                driver = neo4j_client()
+
+                with st.spinner("Running evaluation — querying graph and scoring with RAGAS..."):
+                    results_df = run_evaluation(
+                        driver, qa_pairs,
+                        model=eval_model,
+                        max_hops=eval_max_hops,
+                    )
+                    st.session_state["eval_results"] = results_df
+                    st.session_state["eval_max_hops_used"] = eval_max_hops
+
+                neo4j_client.close()
+                st.success("Evaluation complete.")
+            except Exception as e:
+                st.error(f"Evaluation failed: {e}")
+
+    results_df = st.session_state.get("eval_results")
+    if results_df is not None and not results_df.empty:
+        used_max_hops = st.session_state.get("eval_max_hops_used", 3)
+        summary = compute_summary(results_df, used_max_hops)
+
+        st.divider()
+        st.subheader("Evaluation Results")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Avg Faithfulness", f"{summary['avg_faithfulness']:.3f}")
+        c2.metric("Avg Answer Relevancy", f"{summary['avg_answer_relevancy']:.3f}")
+        c3.metric("Avg Context Precision", f"{summary['avg_context_precision']:.3f}")
+        c4.metric("Avg Context Recall", f"{summary['avg_context_recall']:.3f}")
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Avg Hops Used", f"{summary['avg_hops_used']:.1f}")
+        c6.metric("Max Hops Configured", summary["max_hops"])
+        c7.metric("Graph Efficiency Score", f"{summary['avg_ges']:.3f}")
+        c8.metric("Questions Evaluated", summary["num_questions"])
+
+        st.subheader("Per-Question Results")
+        display_cols = [
+            "question", "ground_truth", "answer",
+            "faithfulness", "answer_relevancy",
+            "context_precision", "context_recall",
+            "hops_used", "ges",
+        ]
+        st.dataframe(
+            results_df[display_cols].style.format({
+                "faithfulness": "{:.3f}",
+                "answer_relevancy": "{:.3f}",
+                "context_precision": "{:.3f}",
+                "context_recall": "{:.3f}",
+                "ges": "{:.3f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Download Full Results as CSV",
+            data=results_df[display_cols].to_csv(index=False),
+            file_name="evaluation_results.csv",
+            mime="text/csv",
+            key="dl_eval",
+        )
 
 
 CONFIDENCE_COLORS = {"high": "#2ecc71", "medium": "#f39c12", "low": "#e74c3c", "error": "#95a5a6"}
@@ -965,6 +1119,9 @@ def run_floating_chatbot(gen_model: str):
     with st.sidebar:
         st.divider()
         st.header("GraphRAG Chat")
+        max_hops = st.slider("Max Hops", min_value=1, max_value=5, value=2, step=1,
+                              key="chat_hops",
+                              help="How many relationship hops to traverse from matched entities")
         web_available = st.session_state.get("web_sources_enabled", False)
         include_web = st.checkbox("Include web sources", value=False, key="chat_web",
                                   disabled=not web_available)
@@ -1001,7 +1158,7 @@ def run_floating_chatbot(gen_model: str):
             with st.spinner("Searching knowledge graph..."):
                 result = query_graph_rag(
                     driver, question, gen_model,
-                    hops=2,
+                    hops=max_hops,
                     weight_threshold=0.1,
                     confidence_threshold=0.0,
                     include_web_sources=include_web,
