@@ -861,102 +861,101 @@ def run_contextual_enrichment_section(gen_model: str):
 
 def run_web_sources_section(gen_model: str):
     st.divider()
-    st.header("External Web Sources")
-    st.caption("Augment your knowledge graph with related web content")
+    with st.expander("External Web Sources", expanded=False):
+        st.caption("Augment your knowledge graph with related web content")
 
-    ttl_result = st.session_state.get("ttl_result")
-    docs = st.session_state.get("docs")
-    if not ttl_result or not docs:
-        st.info("Generate an ontology and build a Knowledge Graph first.")
-        return
-
-    try:
-        neo4j_client = Neo4jClient()
-        driver = neo4j_client()
-        if not has_any_entities(driver):
-            st.info("No entities in graph. Build a Knowledge Graph first.")
-            neo4j_client.close()
+        ttl_result = st.session_state.get("ttl_result")
+        docs = st.session_state.get("docs")
+        if not ttl_result or not docs:
+            st.info("Generate an ontology and build a Knowledge Graph first.")
             return
-    except Exception:
-        st.warning("Could not connect to Neo4j.")
-        return
 
-    # Show existing web stats if present
-    try:
-        ws = get_web_source_stats(driver)
-        if ws["web_chunks"] > 0:
-            st.session_state["web_sources_enabled"] = True
-            st.success(f"Web content active: **{ws['web_chunks']}** web chunks, **{ws['similar_to_edges']}** SIMILAR_TO edges (avg weight: {ws['avg_edge_weight']:.3f})")
-    except Exception:
-        pass
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        max_articles = st.slider("Max articles", 1, 10, 5, key="ws_max_articles")
-    with col2:
-        sim_threshold = st.slider("Similarity threshold", 0.3, 0.8, 0.5, 0.05,
-                                  key="ws_sim_threshold",
-                                  help="Min cosine similarity to create SIMILAR_TO edge")
-    with col3:
-        max_topics = st.slider("Max topics", 2, 7, 5, key="ws_max_topics")
-
-    if st.button("Fetch & Process Web Sources", type="primary"):
-        with st.status("Processing web sources...", expanded=True) as ws_status:
-            ws_status.update(label="Extracting key topics from your documents...")
-            topics = extract_topics(docs, model=gen_model, max_topics=max_topics)
-            st.info(f"Topics: {', '.join(topics)}")
-
-            ws_status.update(label="Searching the web via OpenAI...")
-            web_docs = search_and_fetch(topics[:max_articles], model=gen_model)
-
-            if not web_docs:
-                st.warning("No content found. Try different documents or topics.")
-                ws_status.update(label="No results", state="error")
+        try:
+            neo4j_client = Neo4jClient()
+            driver = neo4j_client()
+            if not has_any_entities(driver):
+                st.info("No entities in graph. Build a Knowledge Graph first.")
                 neo4j_client.close()
                 return
+        except Exception:
+            st.warning("Could not connect to Neo4j.")
+            return
 
-            st.info(f"Fetched web content for **{len(web_docs)}** topics")
-            with st.expander("Web search results"):
-                for r in web_docs:
-                    st.markdown(f"- **{r['name']}** — {len(r['text'])} chars")
+        try:
+            ws = get_web_source_stats(driver)
+            if ws["web_chunks"] > 0:
+                st.session_state["web_sources_enabled"] = True
+                st.success(f"Web content active: **{ws['web_chunks']}** web chunks, **{ws['similar_to_edges']}** SIMILAR_TO edges (avg weight: {ws['avg_edge_weight']:.3f})")
+        except Exception:
+            pass
 
-            ws_status.update(label=f"Building web knowledge graph ({gen_model})...")
-            schema = ontology_to_schema(ttl_result)
-            progress = st.progress(0, text="Processing web articles...")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            max_articles = st.slider("Max articles", 1, 10, 5, key="ws_max_articles")
+        with col2:
+            sim_threshold = st.slider("Similarity threshold", 0.3, 0.8, 0.5, 0.05,
+                                      key="ws_sim_threshold",
+                                      help="Min cosine similarity to create SIMILAR_TO edge")
+        with col3:
+            max_topics = st.slider("Max topics", 2, 7, 5, key="ws_max_topics")
 
-            def on_web_complete(done, total, name):
-                progress.progress(done / total, text=f"Web article {done}/{total}: {name}")
+        if st.button("Fetch & Process Web Sources", type="primary"):
+            with st.status("Processing web sources...", expanded=True) as ws_status:
+                ws_status.update(label="Extracting key topics from your documents...")
+                topics = extract_topics(docs, model=gen_model, max_topics=max_topics)
+                st.info(f"Topics: {', '.join(topics)}")
 
-            build_web_knowledge_graph(driver, schema, web_docs, gen_model, on_complete=on_web_complete)
+                ws_status.update(label="Searching the web via OpenAI...")
+                web_docs = search_and_fetch(topics[:max_articles], model=gen_model)
 
-            ws_status.update(label="Computing SIMILAR_TO edges...")
-            edge_stats = compute_similar_to_edges(driver, similarity_threshold=sim_threshold)
+                if not web_docs:
+                    st.warning("No content found. Try different documents or topics.")
+                    ws_status.update(label="No results", state="error")
+                    neo4j_client.close()
+                    return
 
-            st.session_state["web_sources_enabled"] = True
-            st.session_state["web_source_stats"] = edge_stats
+                st.info(f"Fetched web content for **{len(web_docs)}** topics")
+                with st.expander("Web search results"):
+                    for r in web_docs:
+                        st.markdown(f"- **{r['name']}** — {len(r['text'])} chars")
 
-            ws_status.update(label="Done!", state="complete")
+                ws_status.update(label=f"Building web knowledge graph ({gen_model})...")
+                schema = ontology_to_schema(ttl_result)
+                progress = st.progress(0, text="Processing web articles...")
 
-    ws_stats = st.session_state.get("web_source_stats")
-    if ws_stats:
-        mcol1, mcol2, mcol3 = st.columns(3)
-        mcol1.metric("SIMILAR_TO Edges", ws_stats["edges_created"])
-        mcol2.metric("Avg Similarity", f"{ws_stats['avg_similarity']:.3f}")
-        mcol3.metric("Max Similarity", f"{ws_stats['max_similarity']:.3f}")
+                def on_web_complete(done, total, name):
+                    progress.progress(done / total, text=f"Web article {done}/{total}: {name}")
 
-    if st.session_state.get("web_sources_enabled"):
-        if st.button("Remove All Web Content", type="secondary"):
-            with st.spinner("Removing web content..."):
-                result = remove_web_content(driver)
-                st.success(
-                    f"Removed {result['web_chunks_removed']} web chunks, "
-                    f"{result['web_documents_removed']} web documents, "
-                    f"{result['edges_removed']} SIMILAR_TO edges."
-                )
-                st.session_state["web_sources_enabled"] = False
-                st.session_state.pop("web_source_stats", None)
+                build_web_knowledge_graph(driver, schema, web_docs, gen_model, on_complete=on_web_complete)
 
-    neo4j_client.close()
+                ws_status.update(label="Computing SIMILAR_TO edges...")
+                edge_stats = compute_similar_to_edges(driver, similarity_threshold=sim_threshold)
+
+                st.session_state["web_sources_enabled"] = True
+                st.session_state["web_source_stats"] = edge_stats
+
+                ws_status.update(label="Done!", state="complete")
+
+        ws_stats = st.session_state.get("web_source_stats")
+        if ws_stats:
+            mcol1, mcol2, mcol3 = st.columns(3)
+            mcol1.metric("SIMILAR_TO Edges", ws_stats["edges_created"])
+            mcol2.metric("Avg Similarity", f"{ws_stats['avg_similarity']:.3f}")
+            mcol3.metric("Max Similarity", f"{ws_stats['max_similarity']:.3f}")
+
+        if st.session_state.get("web_sources_enabled"):
+            if st.button("Remove All Web Content", type="secondary"):
+                with st.spinner("Removing web content..."):
+                    result = remove_web_content(driver)
+                    st.success(
+                        f"Removed {result['web_chunks_removed']} web chunks, "
+                        f"{result['web_documents_removed']} web documents, "
+                        f"{result['edges_removed']} SIMILAR_TO edges."
+                    )
+                    st.session_state["web_sources_enabled"] = False
+                    st.session_state.pop("web_source_stats", None)
+
+        neo4j_client.close()
 
 
 def run_floating_chatbot(gen_model: str):
