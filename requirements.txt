@@ -15,3 +15,4 @@ certifi>=2024.0.0
 numpy>=1.26.0
 ragas>=0.2.0
 langchain-openai>=0.3.0
+rapidfuzz>=3.0.0
