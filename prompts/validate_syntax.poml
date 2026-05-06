@@ -37,6 +37,6 @@ An RDF parser reported the following errors:
 Return ONLY the corrected, complete RDF Turtle ontology. No markdown fences, no explanation. The response must start with @prefix and be directly parseable by an RDF Turtle parser.
 </output-format>
 
-<runtime temperature="0.1" />
+<runtime temperature="0" seed="42" />
 
 </poml>

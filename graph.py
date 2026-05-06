@@ -95,6 +95,94 @@ def _get_properties_for_class(g: RDFGraph, class_uri) -> list[PropertyType]:
     return props
 
 
+_CLASS_ALIASES = {
+    "SourceSystem": "DataStore",
+    "ERPSystem": "DataStore",
+    "Database": "DataStore",
+    "DataSource": "DataStore",
+    "Repository": "DataStore",
+    "SourceTable": "Table",
+    "DatabaseTable": "Table",
+    "SAPTable": "Table",
+    "RevenueStream": "Stream",
+    "BusinessStream": "Stream",
+    "BusinessLine": "Stream",
+    "BusinessRule": "EntityCode",
+    "LogicRule": "EntityCode",
+    "Rule": "EntityCode",
+    "AccountCode": "Account",
+    "GLAccount": "Account",
+    "DataFile": "File",
+    "SourceFile": "File",
+    "ShipmentParty": "Shipment",
+    "ShippingRole": "Shipment",
+    "Recipient": "Consignee",
+}
+
+_REL_ALIASES = {
+    "containsTable": "holdsData",
+    "hasTable": "holdsData",
+    "usesTable": "holdsData",
+    "sourceTable": "holdsData",
+    "hasSourceSystem": "storesDataIn",
+    "storedIn": "storesDataIn",
+    "loadsFrom": "storesDataIn",
+    "loadedFrom": "storesDataIn",
+    "containsFile": "receivesFile",
+    "hasFile": "receivesFile",
+    "hasRevenueStream": "hasStream",
+    "partOfStream": "hasStream",
+    "belongsToStream": "hasStream",
+    "containsAccount": "hasAccount",
+    "holdsAccount": "hasAccount",
+    "hasFiscalPeriod": "hasFiscalPeriod",
+    "fiscalPeriod": "hasFiscalPeriod",
+}
+
+
+def normalize_ontology(ttl_string: str) -> str:
+    g = RDFGraph()
+    g.parse(data=ttl_string, format="turtle")
+
+    EX = __import__("rdflib", fromlist=["Namespace"]).Namespace("http://example.org/ontology#")
+
+    replacements = {}
+
+    for cls in list(g.subjects(RDF.type, OWL.Class)):
+        label = _get_local_part(cls)
+        canonical = _CLASS_ALIASES.get(label)
+        if canonical and label != canonical:
+            new_uri = EX[canonical]
+            replacements[cls] = new_uri
+            logger.info(f"Ontology normalization: class {label} → {canonical}")
+
+    for op in list(g.subjects(RDF.type, OWL.ObjectProperty)):
+        label = _get_local_part(op)
+        canonical = _REL_ALIASES.get(label)
+        if canonical and label != canonical:
+            new_uri = EX[canonical]
+            replacements[op] = new_uri
+            logger.info(f"Ontology normalization: property {label} → {canonical}")
+
+    if not replacements:
+        logger.info("Ontology normalization: no changes needed")
+        return ttl_string
+
+    new_g = RDFGraph()
+    for prefix, ns in g.namespaces():
+        new_g.bind(prefix, ns)
+
+    for s, p, o in g:
+        s = replacements.get(s, s)
+        p = replacements.get(p, p)
+        o = replacements.get(o, o)
+        new_g.add((s, p, o))
+
+    normalized = new_g.serialize(format="turtle")
+    logger.info(f"Ontology normalization: {len(replacements)} replacements applied")
+    return normalized
+
+
 def ontology_to_schema(ttl_string: str) -> GraphSchema:
     g = RDFGraph()
     g.parse(data=ttl_string, format="turtle")
@@ -365,6 +453,187 @@ def enrich_relationships(
 
     logger.info(f"Relationship enrichment: {total_created} relationships across {len(chunks)} chunks")
     return {"created": total_created, "chunks_processed": len(chunks)}
+
+
+# ---------------------------------------------------------------------------
+# Global cross-chunk enrichment (schema-free)
+# ---------------------------------------------------------------------------
+_GLOBAL_ENRICHMENT_PROMPT = """You are a knowledge graph relationship extraction expert specializing in technical documentation, bullet-point notes, and tabular/structured formats.
+
+You are given ALL text from a document and ALL entities already extracted. Many entities are ORPHANED (marked with ** below). Your PRIMARY job is to connect every orphan to the graph.
+
+FULL DOCUMENT TEXT:
+{all_text}
+
+ALL ENTITIES IN THE GRAPH (* = orphan, needs connections):
+{entities_list}
+
+EXISTING RELATIONSHIPS (already in graph — do NOT duplicate):
+{existing_rels}
+
+CRITICAL — how to read structured/bullet-point text:
+1. NUMBERED OR BULLETED LISTS often express parent-child or category-member relationships.
+   Example: "Major Stream - \\nParts/Products\\nServices\\nProjects" means EDW REVENUE MARGIN hasStream each of those.
+2. INLINE TABLE REFERENCES like "COPA - Tables for Parts/Products" mean COPA servesStream Parts/Products.
+3. SHORTCODE-TO-PATH PATTERNS like "BRP PARTS EDW.SRC_SAPECC_BRP.CE11000" mean BRP PARTS is an alias for SRC_SAPECC_BRP (aliasOf) and uses table CE11000.
+4. DASH-SEPARATED DEFINITIONS like "SHIP TO – To whom we ship" are glossary definitions — the entity is a concept DEFINED within the domain (definedIn the main system).
+5. BULLET LOGIC ITEMS like "ENTITY_CODE Logic", "HGR_FLAG logic", "GO_LIVE logic" are business rules APPLIED TO the main data pipeline.
+6. PROXIMITY implies relationship — items listed under a header or in the same bullet group are related to each other and to the header.
+7. If entity A and entity B clearly refer to the same concept (e.g., "ENTITY_CODE" and "ENTITY_CODE Logic"), emit a sameAs relationship.
+
+RULES:
+1. Connect EVERY orphan entity (*) to at least one other entity. This is your top priority.
+2. Use camelCase for relationship names (hasStream, usesTable, aliasOf, appliesBusinessRule, servesStream, definedIn, hasFiscalPeriod, hasAccount, loadedFrom, storesDataIn, sameAs, partOf).
+3. Use EXACT entity names from the list. Do not invent new entities.
+4. Do NOT duplicate existing relationships.
+5. When in doubt, connect it — a possibly-correct edge is better than an orphan node.
+
+Return a JSON object with key "relationships" containing an array. Each element: {{"source": "exact entity name", "source_type": "label", "relationship": "relName", "target": "exact entity name", "target_type": "label"}}.
+
+Return ONLY the JSON. No explanation."""
+
+
+def _run_global_enrichment_pass(
+    driver: Driver,
+    client: OpenAI,
+    model: str,
+    all_text: str,
+    pass_num: int,
+) -> int:
+    with driver.session() as session:
+        entities = session.run('''
+            MATCH (n) WHERE n.name IS NOT NULL
+            AND NONE(lbl IN labels(n) WHERE lbl IN $labels)
+            WITH n, [lbl IN labels(n) WHERE NOT lbl IN ['__Entity__', '__KGBuilder__']][0] AS label
+            RETURN n.name AS name, label, elementId(n) AS id
+        ''', labels=_INFRA_LABELS).data()
+
+        existing = session.run('''
+            MATCH (a)-[r]->(b)
+            WHERE a.name IS NOT NULL AND b.name IS NOT NULL
+            AND NOT type(r) IN $rels
+            RETURN a.name AS src, type(r) AS rel, b.name AS tgt
+        ''', rels=_INFRA_RELS).data()
+
+        orphan_names = set()
+        for e in entities:
+            is_orphan = session.run(
+                "MATCH (n) WHERE elementId(n) = $id "
+                "RETURN NOT EXISTS { MATCH (n)-[r]-() WHERE NOT type(r) IN $rels } AS orphan",
+                id=e["id"], rels=_INFRA_RELS,
+            ).single()["orphan"]
+            if is_orphan:
+                orphan_names.add(e["name"])
+
+    if not orphan_names:
+        logger.info(f"Global enrichment pass {pass_num}: no orphans remaining, skipping")
+        return 0
+
+    entity_map = {e["name"]: e for e in entities}
+    entities_str = "\n".join(
+        f"  - {'*' if e['name'] in orphan_names else ''}{e['name']} (type: {e['label']})"
+        for e in entities
+    )
+    existing_str = "\n".join(f"  ({r['src']})-[{r['rel']}]->({r['tgt']})" for r in existing) or "  (none)"
+    logger.info(f"Global enrichment pass {pass_num}: {len(entities)} entities, {len(orphan_names)} orphans")
+
+    temp = min(0.1 * pass_num, 0.4)
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": _GLOBAL_ENRICHMENT_PROMPT.format(
+                all_text=all_text[:6000],
+                entities_list=entities_str,
+                existing_rels=existing_str,
+            )}],
+            temperature=temp,
+            response_format={"type": "json_object"},
+            max_tokens=4000,
+        )
+        raw = resp.choices[0].message.content.strip()
+        parsed = json.loads(raw)
+        rels = parsed if isinstance(parsed, list) else parsed.get("relationships", [])
+    except Exception as e:
+        logger.warning(f"Global enrichment pass {pass_num} LLM call failed: {e}")
+        return 0
+
+    created = 0
+    with driver.session() as session:
+        for rel in rels:
+            src_name = rel.get("source", "")
+            tgt_name = rel.get("target", "")
+            rel_type = rel.get("relationship", "")
+
+            src_entity = entity_map.get(src_name)
+            tgt_entity = entity_map.get(tgt_name)
+
+            if not src_entity or not tgt_entity or not rel_type:
+                continue
+
+            try:
+                session.run(
+                    f"MATCH (a), (b) "
+                    f"WHERE elementId(a) = $src_id AND elementId(b) = $tgt_id "
+                    f"MERGE (a)-[r:`{rel_type}`]->(b) "
+                    f"RETURN r",
+                    src_id=src_entity["id"], tgt_id=tgt_entity["id"],
+                )
+                created += 1
+            except Exception as e:
+                logger.warning(f"Failed to create relationship {src_name}-[{rel_type}]->{tgt_name}: {e}")
+
+    logger.info(f"Global enrichment pass {pass_num}: {created} relationships created, {len(orphan_names)} orphans targeted")
+    return created
+
+
+def enrich_relationships_global(
+    driver: Driver,
+    model: str = "gpt-4o",
+    max_passes: int = 3,
+    on_progress=None,
+) -> dict:
+    with driver.session() as session:
+        chunks = session.run(
+            "MATCH (c:Chunk) RETURN c.text AS text ORDER BY c.index"
+        ).data()
+        all_text = "\n\n---\n\n".join(c["text"] for c in chunks if c["text"])
+
+    if not all_text:
+        return {"created": 0, "passes": 0}
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    total_created = 0
+    prev_orphan_count = None
+
+    for pass_num in range(1, max_passes + 1):
+        with driver.session() as session:
+            orphan_count = session.run('''
+                MATCH (n) WHERE n.name IS NOT NULL
+                AND NONE(lbl IN labels(n) WHERE lbl IN $labels)
+                AND NOT EXISTS {
+                    MATCH (n)-[r]-() WHERE NOT type(r) IN $rels
+                }
+                RETURN count(n) AS cnt
+            ''', labels=_INFRA_LABELS, rels=_INFRA_RELS).single()["cnt"]
+
+        if orphan_count == 0:
+            logger.info(f"Global enrichment: all entities connected after {pass_num - 1} passes")
+            break
+
+        if prev_orphan_count is not None and orphan_count >= prev_orphan_count:
+            logger.info(f"Global enrichment: orphan count unchanged ({orphan_count}), stopping after {pass_num - 1} passes")
+            break
+
+        prev_orphan_count = orphan_count
+        created = _run_global_enrichment_pass(driver, client, model, all_text, pass_num)
+        total_created += created
+
+        if on_progress:
+            on_progress(pass_num, max_passes)
+
+    logger.info(f"Global enrichment complete: {total_created} total relationships across {pass_num} passes")
+    return {"created": total_created, "passes": pass_num}
 
 
 # ---------------------------------------------------------------------------

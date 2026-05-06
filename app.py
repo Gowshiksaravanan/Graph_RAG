@@ -21,9 +21,11 @@ from config import (
 )
 from graph import (
     Neo4jClient,
+    normalize_ontology,
     ontology_to_schema,
     build_knowledge_graph,
     enrich_relationships,
+    enrich_relationships_global,
     normalize_entity_names,
     query_graph_rag,
     get_graph_stats,
@@ -367,6 +369,11 @@ def run_pipeline(uploaded_files, gen_model: str, val_model: str, refine: bool, s
                 st.error(f"Step 2: Could not fix syntax errors after {max_attempts} attempts. Last error: {errors}")
                 ttl_string = fixed_ttl
 
+    # ── Normalize ontology (standardize class/property names) ──
+    status.update(label="Normalizing ontology types...")
+    ttl_string = normalize_ontology(ttl_string)
+    st.success("Ontology normalization complete.")
+
     status.update(label="Done!", state="complete")
     return ttl_string, docs
 
@@ -437,6 +444,16 @@ def run_kg_pipeline(docs, ttl_string, gen_model, status, alpha=0.1, chunk_size=1
 
         enrich_stats = enrich_relationships(driver, schema, model=gen_model, on_progress=on_enrich_progress)
         st.success(f"Relationship enrichment: **{enrich_stats['created']}** relationships found across **{enrich_stats['chunks_processed']}** chunks")
+
+        # ── Global cross-chunk enrichment (iterative) ──
+        status.update(label="Global enrichment (iterative — connecting orphan entities)...")
+        global_progress = st.progress(0, text="Pass 1/3...")
+
+        def on_global_progress(done, total):
+            global_progress.progress(done / total, text=f"Pass {done}/{total}")
+
+        global_stats = enrich_relationships_global(driver, model=gen_model, on_progress=on_global_progress)
+        st.success(f"Global enrichment: **{global_stats['created']}** relationships created over **{global_stats['passes']}** passes")
 
         # ── Compute edge weights ──
         status.update(label="Computing edge weights...")

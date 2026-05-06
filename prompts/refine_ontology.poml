@@ -43,6 +43,6 @@ Output the COMPLETE corrected and extended ontology in valid RDF Turtle syntax.
 Return ONLY the complete, corrected RDF Turtle ontology. Start with the @prefix declarations. No markdown fences, no explanation. If nothing to change, return: NO_ADDITIONS_NEEDED
 </output-format>
 
-<runtime temperature="0.3" />
+<runtime temperature="0" seed="42" />
 
 </poml>

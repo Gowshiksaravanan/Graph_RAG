@@ -76,6 +76,6 @@ Do not include any explanation before or after the Turtle content.
 The response must start with @prefix and be directly parseable by an RDF Turtle parser.
 </output-format>
 
-<runtime temperature="0.2" />
+<runtime temperature="0" seed="42" />
 
 </poml>
