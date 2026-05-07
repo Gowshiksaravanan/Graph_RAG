@@ -1094,7 +1094,16 @@ def run_entity_resolution_section():
                 i: p["confidence"] == "high" for i, p in enumerate(sorted_pairs)
             }
 
-        for i, pair in enumerate(sorted_pairs):
+        page_size = 50
+        total_pages = max(1, (len(sorted_pairs) + page_size - 1) // page_size)
+        page = st.number_input("Page", min_value=1, max_value=total_pages, value=1,
+                                key="er_page", step=1)
+        start_idx = (page - 1) * page_size
+        end_idx = min(start_idx + page_size, len(sorted_pairs))
+        st.caption(f"Showing pairs {start_idx + 1}–{end_idx} of {len(sorted_pairs)}")
+
+        for i in range(start_idx, end_idx):
+            pair = sorted_pairs[i]
             color = CONFIDENCE_COLORS.get(pair["confidence"], "#aaa")
             name_a = pair.get("props_a", {}).get("name", pair["name"])
             name_b = pair.get("props_b", {}).get("name", pair["name"])
