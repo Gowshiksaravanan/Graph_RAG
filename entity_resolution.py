@@ -170,51 +170,55 @@ MERGE: <one sentence reason>
 KEEP_SEPARATE: <one sentence reason>"""
 
 
-def score_llm_batch(pairs: list[dict], model: str = "gpt-4o-mini") -> list[dict]:
-    if not pairs:
-        return []
+LLM_BATCH_PROMPT = """You are an entity resolution expert. For each pair below, decide MERGE or KEEP_SEPARATE.
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    results = []
+{pair_block}
 
-    for pair in pairs:
+Respond with one line per pair in exact format:
+PAIR <number>: MERGE: <reason>
+or
+PAIR <number>: KEEP_SEPARATE: <reason>"""
+
+
+def _format_pair_block(pairs: list[dict]) -> str:
+    lines = []
+    for i, pair in enumerate(pairs, 1):
         props_a = {k: v for k, v in pair["props_a"].items() if k not in ("embedding",)}
         props_b = {k: v for k, v in pair["props_b"].items() if k not in ("embedding",)}
-
-        prompt = LLM_JUDGE_PROMPT.format(
-            label_a=pair["label_a"], name_a=pair.get("props_a", {}).get("name", pair["name"]),
-            props_a=props_a,
-            label_b=pair["label_b"], name_b=pair.get("props_b", {}).get("name", pair["name"]),
-            props_b=props_b,
+        name_a = pair.get("props_a", {}).get("name", pair["name"])
+        name_b = pair.get("props_b", {}).get("name", pair["name"])
+        lines.append(
+            f"PAIR {i}:\n"
+            f"  A: [{pair['label_a']}] {name_a} — {props_a}\n"
+            f"  B: [{pair['label_b']}] {name_b} — {props_b}"
         )
+    return "\n\n".join(lines)
 
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=150,
-            )
-            answer = response.choices[0].message.content.strip()
 
-            if answer.startswith("MERGE:"):
+def _parse_batch_response(response_text: str, pairs: list[dict]) -> list[dict]:
+    results = []
+    lines = [l.strip() for l in response_text.strip().split("\n") if l.strip()]
+
+    answer_map = {}
+    for line in lines:
+        import re as _re
+        m = _re.match(r"PAIR\s*(\d+)\s*:\s*(MERGE|KEEP_SEPARATE)\s*:\s*(.*)", line)
+        if m:
+            answer_map[int(m.group(1))] = (m.group(2), m.group(3).strip())
+
+    for i, pair in enumerate(pairs, 1):
+        if i in answer_map:
+            decision, reason = answer_map[i]
+            if decision == "MERGE":
                 score = 1.0
                 confidence = "high" if pair["label_a"] == pair["label_b"] else "medium"
-                reason = answer[6:].strip()
-            elif answer.startswith("KEEP_SEPARATE:"):
+            else:
                 score = 0.0
                 confidence = "low"
-                reason = answer[14:].strip()
-            else:
-                score = 0.5
-                confidence = "medium"
-                reason = answer
-
-        except Exception as e:
-            logger.error(f"LLM judge error for '{pair['name']}': {e}")
-            score = -1
-            confidence = "error"
-            reason = f"LLM error: {e}"
+        else:
+            score = 0.5
+            confidence = "medium"
+            reason = "Could not parse LLM response for this pair"
 
         results.append({
             **pair,
@@ -223,6 +227,38 @@ def score_llm_batch(pairs: list[dict], model: str = "gpt-4o-mini") -> list[dict]
             "confidence": confidence,
             "reason": reason,
         })
+
+    return results
+
+
+def score_llm_batch(pairs: list[dict], model: str = "gpt-4o-mini") -> list[dict]:
+    if not pairs:
+        return []
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    results = []
+    batch_size = 20
+
+    for start in range(0, len(pairs), batch_size):
+        batch = pairs[start:start + batch_size]
+        pair_block = _format_pair_block(batch)
+        prompt = LLM_BATCH_PROMPT.format(pair_block=pair_block)
+
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=50 * len(batch),
+            )
+            answer = response.choices[0].message.content.strip()
+            results.extend(_parse_batch_response(answer, batch))
+        except Exception as e:
+            logger.error(f"LLM batch judge error: {e}")
+            results.extend([{
+                **p, "score_type": "llm", "score": -1,
+                "confidence": "error", "reason": f"LLM error: {e}",
+            } for p in batch])
 
     return results
 
