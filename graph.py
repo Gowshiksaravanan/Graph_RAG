@@ -27,6 +27,7 @@ from neo4j_graphrag.embeddings import OpenAIEmbeddings
 from neo4j_graphrag.indexes import create_vector_index
 from neo4j_graphrag.retrievers import VectorCypherRetriever
 from neo4j_graphrag.generation import GraphRAG
+from neo4j_graphrag.generation.prompts import RagTemplate
 from neo4j_graphrag.types import RetrieverResultItem
 
 from config import NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, OPENAI_API_KEY
@@ -1034,14 +1035,34 @@ def query_graph_rag(
     llm = OpenAILLM(
         api_key=OPENAI_API_KEY,
         model_name=model,
-        model_params={"temperature": 0.3, "max_tokens": 2000},
+        model_params={"temperature": 0.1, "max_tokens": 1000},
     )
 
-    rag = GraphRAG(retriever=retriever, llm=llm)
+    prompt = RagTemplate(
+        template="""Context:
+{context}
+
+Examples:
+{examples}
+
+Question:
+{query_text}
+
+Answer:
+""",
+        system_instructions=(
+            "Answer the user question using ONLY the provided context. "
+            "Do not add information that is not explicitly stated in the context. "
+            "If the context does not contain enough information, say so. "
+            "Be concise and specific — prefer short, factual answers over long explanations."
+        ),
+    )
+
+    rag = GraphRAG(retriever=retriever, llm=llm, prompt_template=prompt)
 
     result = rag.search(
         query_text=question,
-        retriever_config={"top_k": 5},
+        retriever_config={"top_k": 8},
         return_context=True,
     )
 
