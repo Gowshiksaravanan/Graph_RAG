@@ -1,4 +1,3 @@
-import re
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
@@ -16,7 +15,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings as LCOpenAIEmbeddings
 from langchain_core.documents import Document as LCDocument
 
 from config import OPENAI_API_KEY
-from graph import Neo4jClient, query_graph_rag, has_any_entities
+from graph import Neo4jClient, query_graph_rag, has_any_entities, measure_answer_hops
 
 
 def _run_in_thread(fn, *args, **kwargs):
@@ -35,26 +34,16 @@ def _run_in_thread(fn, *args, **kwargs):
         return future.result()
 
 
-def _extract_hops(context_items: list[dict]) -> int:
-    max_hops = 0
-    for item in context_items:
-        text = item.get("text", "")
-        arrows = text.count("]->")
-        if arrows > max_hops:
-            max_hops = arrows
-    return max_hops
-
-
 def _parse_context_items(result: dict) -> tuple[list[str], list[dict]]:
     contexts = []
     raw_items = []
     if result["context"] and result["context"].items:
         for i, item in enumerate(result["context"].items, 1):
             content_str = str(item.content)
-            contexts.append(content_str[:2000])
-            score_match = re.search(r"score=([\d.]+)", content_str)
-            score_val = f"{float(score_match.group(1)):.4f}" if score_match else "N/A"
-            raw_items.append({"index": i, "score": score_val, "text": content_str[:500]})
+            contexts.append(content_str[:4000])
+            meta = item.metadata if isinstance(item.metadata, dict) else {}
+            score_val = f"{meta['score']:.4f}" if "score" in meta else "N/A"
+            raw_items.append({"index": i, "score": score_val, "text": content_str[:2000]})
     return contexts, raw_items
 
 
@@ -117,7 +106,12 @@ def run_evaluation(
             )
             answer = result["answer"]
             contexts, raw_items = _parse_context_items(result)
-            hops_used = _extract_hops(raw_items)
+            hops_used = result.get("hops_used", 0)
+            if hops_used == 0:
+                hops_used = measure_answer_hops(
+                    driver, question, answer, max_hops=max_hops,
+                )
+            logger.info(f"Q: {question[:80]}... → hops_used={hops_used}")
         except Exception as e:
             logger.error(f"Query failed for: {question} — {e}")
             answer = f"Error: {e}"

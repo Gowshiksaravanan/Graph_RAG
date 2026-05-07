@@ -27,6 +27,7 @@ from neo4j_graphrag.embeddings import OpenAIEmbeddings
 from neo4j_graphrag.indexes import create_vector_index
 from neo4j_graphrag.retrievers import VectorCypherRetriever
 from neo4j_graphrag.generation import GraphRAG
+from neo4j_graphrag.types import RetrieverResultItem
 
 from config import NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, OPENAI_API_KEY
 
@@ -931,6 +932,33 @@ def ensure_vector_index(driver: Driver):
         logger.warning(f"Vector index creation note: {e}")
 
 
+def _graph_rag_result_formatter(record) -> RetrieverResultItem:
+    node_text = record.get("text", "") or ""
+    score = record.get("score", 0.0)
+    rels = record.get("relationships", []) or []
+    web = record.get("web_context", []) or []
+
+    rels = [r for r in rels if r]
+
+    max_hops = 0
+    for r in rels:
+        hops_count = r.count("]->")
+        if hops_count > max_hops:
+            max_hops = hops_count
+
+    content = node_text
+    if rels:
+        content += "\n\nGraph paths:\n" + "\n".join(rels)
+    web_filtered = [w for w in web if w]
+    if web_filtered:
+        content += "\n\nWeb sources:\n" + "\n".join(web_filtered)
+
+    return RetrieverResultItem(
+        content=content,
+        metadata={"score": score, "max_hops": max_hops, "num_paths": len(rels)},
+    )
+
+
 def query_graph_rag(
     driver: Driver,
     question: str,
@@ -1000,6 +1028,7 @@ def query_graph_rag(
         index_name=VECTOR_INDEX_NAME,
         retrieval_query=retrieval_query,
         embedder=embedder,
+        result_formatter=_graph_rag_result_formatter,
     )
 
     llm = OpenAILLM(
@@ -1016,8 +1045,76 @@ def query_graph_rag(
         return_context=True,
     )
 
+    max_hops_found = 0
+    if result.retriever_result and result.retriever_result.items:
+        for item in result.retriever_result.items:
+            if isinstance(item.metadata, dict):
+                h = item.metadata.get("max_hops", 0)
+                if h > max_hops_found:
+                    max_hops_found = h
+
     return {
         "answer": result.answer,
         "context": result.retriever_result,
         "retriever": "hybrid",
+        "hops_used": max_hops_found,
     }
+
+
+def measure_answer_hops(
+    driver: Driver,
+    question: str,
+    answer: str,
+    max_hops: int = 5,
+) -> int:
+    with driver.session() as session:
+        entities = session.run(
+            "MATCH (n) WHERE n.name IS NOT NULL "
+            "AND NONE(lbl IN labels(n) WHERE lbl IN $labels) "
+            "RETURN n.name AS name, elementId(n) AS id",
+            labels=_INFRA_LABELS,
+        ).data()
+
+    if not entities:
+        return 0
+
+    q_lower = question.lower()
+    a_lower = answer.lower()
+
+    q_ids = set()
+    a_ids = set()
+
+    for e in entities:
+        name = e["name"].strip()
+        if len(name) < 3:
+            continue
+        name_lower = name.lower()
+        if name_lower in q_lower:
+            q_ids.add(e["id"])
+        if name_lower in a_lower:
+            a_ids.add(e["id"])
+
+    a_only_ids = a_ids - q_ids
+
+    if not q_ids or not a_only_ids:
+        return 1 if (q_ids and a_ids) else 0
+
+    max_path = 0
+    with driver.session() as session:
+        for qid in list(q_ids)[:10]:
+            for aid in list(a_only_ids)[:10]:
+                try:
+                    result = session.run(
+                        "MATCH (a), (b) "
+                        "WHERE elementId(a) = $qid AND elementId(b) = $aid "
+                        f"MATCH p = shortestPath((a)-[*..{max_hops}]-(b)) "
+                        "WHERE NONE(r IN relationships(p) WHERE type(r) IN $rels) "
+                        "RETURN length(p) AS hops LIMIT 1",
+                        qid=qid, aid=aid, rels=_INFRA_RELS,
+                    ).single()
+                    if result and result["hops"] and result["hops"] > max_path:
+                        max_path = result["hops"]
+                except Exception:
+                    continue
+
+    return max_path
