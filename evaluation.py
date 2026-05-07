@@ -12,6 +12,15 @@ from ragas.metrics import (
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from ragas.testset import TestsetGenerator
+from ragas.testset.transforms import (
+    SummaryExtractor,
+    EmbeddingExtractor,
+    CustomNodeFilter,
+    CosineSimilarityBuilder,
+    OverlapScoreBuilder,
+    Parallel,
+)
+from ragas.testset.transforms.extractors.llm_based import NERExtractor, ThemesExtractor
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings as LCOpenAIEmbeddings
 from langchain_core.documents import Document as LCDocument
 
@@ -113,7 +122,30 @@ def generate_testset(texts: list[str], model: str = "gpt-4o", testset_size: int 
             )
         )
         generator = TestsetGenerator(llm=llm, embedding_model=embeddings)
-        return generator.generate_with_langchain_docs(lc_docs, testset_size=testset_size)
+        transforms = [
+            SummaryExtractor(llm=llm),
+            CustomNodeFilter(llm=llm),
+            Parallel(
+                EmbeddingExtractor(
+                    embedding_model=embeddings,
+                    property_name="summary_embedding",
+                    embed_property_name="summary",
+                ),
+                ThemesExtractor(llm=llm),
+                NERExtractor(llm=llm),
+            ),
+            Parallel(
+                CosineSimilarityBuilder(
+                    property_name="summary_embedding",
+                    new_property_name="summary_similarity",
+                    threshold=0.5,
+                ),
+                OverlapScoreBuilder(threshold=0.01),
+            ),
+        ]
+        return generator.generate_with_langchain_docs(
+            lc_docs, testset_size=testset_size, transforms=transforms,
+        )
 
     for attempt in range(3):
         try:
