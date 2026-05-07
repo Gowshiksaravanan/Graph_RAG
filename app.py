@@ -82,7 +82,125 @@ def extract_text(uploaded_file) -> str:
         doc = Document(io.BytesIO(uploaded_file.read()))
         return "\n".join(para.text for para in doc.paragraphs)
 
+    if name.endswith(".csv"):
+        import csv as csv_mod
+        content = uploaded_file.read().decode("utf-8")
+        reader = csv_mod.reader(io.StringIO(content))
+        rows = list(reader)
+        if not rows:
+            return ""
+        header = rows[0]
+        lines = []
+        for row in rows[1:]:
+            lines.append(", ".join(f"{h}: {v}" for h, v in zip(header, row) if v.strip()))
+        return "\n".join(lines)
+
     return ""
+
+
+def parse_csv_file(uploaded_file) -> dict | None:
+    import csv as csv_mod
+    content = uploaded_file.read().decode("utf-8")
+    uploaded_file.seek(0)
+    reader = csv_mod.reader(io.StringIO(content))
+    rows = list(reader)
+    if len(rows) < 2:
+        return None
+    headers = [h.strip() for h in rows[0] if h.strip()]
+    data_rows = rows[1:]
+    return {"headers": headers, "rows": data_rows, "name": uploaded_file.name}
+
+
+def _to_pascal(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "", name.title())
+
+
+def _to_camel(name: str) -> str:
+    pascal = _to_pascal(name)
+    return pascal[0].lower() + pascal[1:] if pascal else pascal
+
+
+def _is_numeric_column(rows: list[list[str]], col_idx: int) -> bool:
+    sample = [r[col_idx] for r in rows[:50] if col_idx < len(r) and r[col_idx].strip()]
+    if not sample:
+        return False
+    numeric = sum(1 for v in sample if re.match(r'^-?[\d,]+\.?\d*%?$', v.strip().replace(',', '')))
+    return numeric / len(sample) > 0.7
+
+
+def _detect_id_columns(headers: list[str]) -> list[int]:
+    id_patterns = re.compile(r'(?i)(^id$|_id$|Id$|code|key|number|num|#)')
+    return [i for i, h in enumerate(headers) if id_patterns.search(h)]
+
+
+def generate_csv_ontology(csv_meta: dict) -> str:
+    headers = csv_meta["headers"]
+    rows = csv_meta["rows"]
+
+    id_cols = _detect_id_columns(headers)
+    if not id_cols:
+        id_cols = [0]
+
+    entity_name = _to_pascal(re.sub(r'\.\w+$', '', csv_meta["name"]))
+    if entity_name.lower().endswith("s") and len(entity_name) > 3:
+        entity_name = entity_name[:-1]
+
+    lines = [
+        '@prefix ex: <http://example.org/ontology#> .',
+        '@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .',
+        '@prefix owl: <http://www.w3.org/2002/07/owl#> .',
+        '@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .',
+        '',
+        f'ex:{entity_name} a owl:Class ;',
+        f'    rdfs:label "{entity_name}" .',
+        '',
+    ]
+
+    ref_classes = set()
+    relationships = []
+
+    for i, header in enumerate(headers):
+        prop_name = _to_camel(header)
+        if not prop_name:
+            continue
+
+        if _is_numeric_column(rows, i):
+            dtype = "xsd:decimal"
+        else:
+            unique_vals = set()
+            for r in rows[:100]:
+                if i < len(r) and r[i].strip():
+                    unique_vals.add(r[i].strip())
+            cardinality = len(unique_vals)
+            total_rows = min(len(rows), 100)
+
+            if 2 <= cardinality <= total_rows * 0.3 and i not in id_cols:
+                ref_class = _to_pascal(header)
+                if ref_class not in ref_classes:
+                    ref_classes.add(ref_class)
+                    lines.append(f'ex:{ref_class} a owl:Class ;')
+                    lines.append(f'    rdfs:label "{ref_class}" .')
+                    lines.append('')
+                rel_name = _to_camel("has_" + header)
+                relationships.append((entity_name, rel_name, ref_class))
+                continue
+
+            dtype = "xsd:string"
+
+        lines.append(f'ex:{prop_name} a owl:DatatypeProperty ;')
+        lines.append(f'    rdfs:label "{header}" ;')
+        lines.append(f'    rdfs:domain ex:{entity_name} ;')
+        lines.append(f'    rdfs:range {dtype} .')
+        lines.append('')
+
+    for src, rel, tgt in relationships:
+        lines.append(f'ex:{rel} a owl:ObjectProperty ;')
+        lines.append(f'    rdfs:label "{rel}" ;')
+        lines.append(f'    rdfs:domain ex:{src} ;')
+        lines.append(f'    rdfs:range ex:{tgt} .')
+        lines.append('')
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -255,30 +373,75 @@ def run_pipeline(uploaded_files, gen_model: str, val_model: str, refine: bool, s
     client = OpenAI(api_key=OPENAI_API_KEY)
     doc_budget = KNOWN_MODEL_LIMITS[gen_model]["doc_budget"]
 
+    # ── Separate CSV files from text-based files ──
+    csv_files = []
+    text_files = []
+    for f in uploaded_files:
+        if f.name.lower().endswith(".csv"):
+            csv_files.append(f)
+        else:
+            text_files.append(f)
+
     # ── Extract text ──
     status.update(label="Extracting text from documents...")
     docs = []
-    for f in uploaded_files:
+    for f in text_files:
         text = extract_text(f)
         if text.strip():
             tokens = count_tokens(text)
             docs.append({"name": f.name, "text": text, "tokens": tokens})
+
+    # ── Generate deterministic ontology for CSVs ──
+    csv_ttl_fragments = []
+    for f in csv_files:
+        csv_meta = parse_csv_file(f)
+        if csv_meta:
+            csv_ttl = generate_csv_ontology(csv_meta)
+            csv_ttl_fragments.append(csv_ttl)
+            text = extract_text(f)
+            f.seek(0)
+            if text.strip():
+                tokens = count_tokens(text)
+                docs.append({"name": f.name, "text": text, "tokens": tokens})
+            st.success(f"CSV **{f.name}**: ontology generated deterministically from column headers.")
 
     if not docs:
         st.error("No text could be extracted from the uploaded files.")
         return None, []
 
     total_tokens = sum(d["tokens"] for d in docs)
+    non_csv_docs = [d for d in docs if not d["name"].lower().endswith(".csv")]
+
     st.info(
         f"Loaded **{len(docs)} documents** — "
         f"**{total_tokens:,} tokens** total | "
         f"Model budget: **{doc_budget:,} tokens**"
     )
 
-    # ── Step 1a: Generate initial ontology ──
-    if total_tokens <= doc_budget:
+    # ── If only CSVs, skip LLM ontology generation ──
+    if not non_csv_docs and csv_ttl_fragments:
+        ttl_string = merge_ttl_fragments(csv_ttl_fragments) if len(csv_ttl_fragments) > 1 else csv_ttl_fragments[0]
+        st.success("Step 1a complete: Ontology generated deterministically from CSV structure (no LLM needed).")
+
+        is_valid, result = validate_ttl(ttl_string)
+        if is_valid:
+            ttl_string = result
+        else:
+            st.warning(f"CSV ontology has syntax issues: {result}")
+
+        status.update(label="Normalizing ontology types...")
+        ttl_string = normalize_ontology(ttl_string)
+        st.success("Ontology normalization complete.")
+        status.update(label="Done!", state="complete")
+        return ttl_string, docs
+
+    # ── Step 1a: Generate initial ontology (LLM — text docs only) ──
+    llm_docs = non_csv_docs if non_csv_docs else docs
+    llm_tokens = sum(d["tokens"] for d in llm_docs)
+
+    if llm_tokens <= doc_budget:
         status.update(label=f"Step 1a: Generating ontology ({gen_model}) — direct path...")
-        doc_text = build_document_block(docs)
+        doc_text = build_document_block(llm_docs)
         ttl_string = call_prompt_1a(client, gen_model, doc_text)
     else:
         status.update(label="Documents exceed budget. Chunking...")
@@ -372,6 +535,13 @@ def run_pipeline(uploaded_files, gen_model: str, val_model: str, refine: bool, s
             if attempt == max_attempts:
                 st.error(f"Step 2: Could not fix syntax errors after {max_attempts} attempts. Last error: {errors}")
                 ttl_string = fixed_ttl
+
+    # ── Merge CSV ontology fragments (if mixed upload) ──
+    if csv_ttl_fragments:
+        status.update(label="Merging CSV ontology with LLM ontology...")
+        all_fragments = [ttl_string] + csv_ttl_fragments
+        ttl_string = merge_ttl_fragments(all_fragments)
+        st.success(f"Merged LLM ontology with {len(csv_ttl_fragments)} CSV ontology fragment(s).")
 
     # ── Normalize ontology (standardize class/property names) ──
     status.update(label="Normalizing ontology types...")
