@@ -976,7 +976,7 @@ def query_graph_rag(
         + web_clause +
 
         "WITH node, score, "
-        "collect(DISTINCT "
+        "collect(DISTINCT CASE WHEN path IS NOT NULL THEN "
         "reduce(s = '', idx IN range(0, size(relationships(path))-1) | "
         "s + CASE WHEN idx > 0 THEN ' -> ' ELSE '' END "
         "+ coalesce(nodes(path)[idx].name, '?') "
@@ -985,7 +985,7 @@ def query_graph_rag(
         "+ ' conf:' + toString(coalesce(relationships(path)[idx].agg_confidence, 0.5)) "
         "+ ']-> ' "
         "+ CASE WHEN idx = size(relationships(path))-1 THEN coalesce(target.name, '?') ELSE '' END"
-        ")) AS relationships"
+        ") ELSE NULL END) AS relationships"
 
         + web_with + " "
 
