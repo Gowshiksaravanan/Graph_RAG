@@ -25,11 +25,34 @@ def _run_in_thread(fn, *args, **kwargs):
     def _target():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        return fn(*args, **kwargs)
+        # Tell sniffio that asyncio is the active async library so anyio
+        # (used internally by RAGAS) can detect the backend even though
+        # the loop is not yet running.  This is thread-local via
+        # contextvars and does NOT affect Streamlit's main event loop.
+        token = None
+        try:
+            import sniffio
+            token = sniffio.current_async_library_cvar.set("asyncio")
+        except (ImportError, AttributeError):
+            pass
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if token is not None:
+                try:
+                    import sniffio
+                    sniffio.current_async_library_cvar.reset(token)
+                except (ImportError, AttributeError):
+                    pass
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_target)
-        return future.result()
+        return future.result(timeout=600)
 
 
 def _parse_context_items(result: dict) -> tuple[list[str], list[dict]]:
