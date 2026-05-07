@@ -36,7 +36,7 @@ KNOWN_MODEL_LIMITS = {
 TIKTOKEN_ENCODING = "cl100k_base"
 BATCH_TOKEN_BUDGET = 30_000
 CHUNK_TOKEN_LIMIT = 2_000
-ACCEPTED_FILE_TYPES = ["txt", "pdf", "docx", "csv"]
+ACCEPTED_FILE_TYPES = ["txt", "pdf", "docx", "doc", "csv", "xlsx"]
 
 WEB_MAX_ARTICLES = 5
 WEB_SIMILARITY_THRESHOLD = 0.5

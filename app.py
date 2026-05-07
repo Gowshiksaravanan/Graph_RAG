@@ -82,6 +82,48 @@ def extract_text(uploaded_file) -> str:
         doc = Document(io.BytesIO(uploaded_file.read()))
         return "\n".join(para.text for para in doc.paragraphs)
 
+    if name.endswith(".doc") and not name.endswith(".docx"):
+        import subprocess
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp:
+            tmp.write(uploaded_file.read())
+            tmp_path = tmp.name
+        try:
+            result = subprocess.run(
+                ["antiword", tmp_path], capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                return result.stdout
+            doc = Document(io.BytesIO(open(tmp_path, "rb").read()))
+            return "\n".join(para.text for para in doc.paragraphs)
+        except Exception:
+            try:
+                doc = Document(io.BytesIO(open(tmp_path, "rb").read()))
+                return "\n".join(para.text for para in doc.paragraphs)
+            except Exception:
+                return ""
+        finally:
+            import os
+            os.unlink(tmp_path)
+
+    if name.endswith(".xlsx"):
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(uploaded_file.read()), read_only=True, data_only=True)
+        all_text = []
+        for sheet in wb.sheetnames:
+            ws = wb[sheet]
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                continue
+            header = [str(c) if c is not None else "" for c in rows[0]]
+            for row in rows[1:]:
+                vals = [str(c) if c is not None else "" for c in row]
+                line = ", ".join(f"{h}: {v}" for h, v in zip(header, vals) if v.strip())
+                if line:
+                    all_text.append(line)
+        wb.close()
+        return "\n".join(all_text)
+
     if name.endswith(".csv"):
         import csv as csv_mod
         content = uploaded_file.read().decode("utf-8")
@@ -104,6 +146,20 @@ def parse_csv_file(uploaded_file) -> dict | None:
     uploaded_file.seek(0)
     reader = csv_mod.reader(io.StringIO(content))
     rows = list(reader)
+    if len(rows) < 2:
+        return None
+    headers = [h.strip() for h in rows[0] if h.strip()]
+    data_rows = rows[1:]
+    return {"headers": headers, "rows": data_rows, "name": uploaded_file.name}
+
+
+def parse_xlsx_file(uploaded_file) -> dict | None:
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(uploaded_file.read()), read_only=True, data_only=True)
+    uploaded_file.seek(0)
+    ws = wb[wb.sheetnames[0]]
+    rows = [[str(c) if c is not None else "" for c in r] for r in ws.iter_rows(values_only=True)]
+    wb.close()
     if len(rows) < 2:
         return None
     headers = [h.strip() for h in rows[0] if h.strip()]
@@ -373,11 +429,12 @@ def run_pipeline(uploaded_files, gen_model: str, val_model: str, refine: bool, s
     client = OpenAI(api_key=OPENAI_API_KEY)
     doc_budget = KNOWN_MODEL_LIMITS[gen_model]["doc_budget"]
 
-    # ── Separate CSV files from text-based files ──
+    # ── Separate structured files (CSV/XLSX) from text-based files ──
+    structured_exts = (".csv", ".xlsx")
     csv_files = []
     text_files = []
     for f in uploaded_files:
-        if f.name.lower().endswith(".csv"):
+        if f.name.lower().endswith(structured_exts):
             csv_files.append(f)
         else:
             text_files.append(f)
@@ -391,19 +448,22 @@ def run_pipeline(uploaded_files, gen_model: str, val_model: str, refine: bool, s
             tokens = count_tokens(text)
             docs.append({"name": f.name, "text": text, "tokens": tokens})
 
-    # ── Generate deterministic ontology for CSVs ──
+    # ── Generate deterministic ontology for structured files (CSV/XLSX) ──
     csv_ttl_fragments = []
     for f in csv_files:
-        csv_meta = parse_csv_file(f)
-        if csv_meta:
-            csv_ttl = generate_csv_ontology(csv_meta)
+        if f.name.lower().endswith(".xlsx"):
+            meta = parse_xlsx_file(f)
+        else:
+            meta = parse_csv_file(f)
+        if meta:
+            csv_ttl = generate_csv_ontology(meta)
             csv_ttl_fragments.append(csv_ttl)
             text = extract_text(f)
             f.seek(0)
             if text.strip():
                 tokens = count_tokens(text)
                 docs.append({"name": f.name, "text": text, "tokens": tokens})
-            st.success(f"CSV **{f.name}**: ontology generated deterministically from column headers.")
+            st.success(f"**{f.name}**: ontology generated deterministically from column headers.")
 
     if not docs:
         st.error("No text could be extracted from the uploaded files.")
@@ -717,7 +777,7 @@ def _run_kg_tab():
         "Upload Documents",
         type=ACCEPTED_FILE_TYPES,
         accept_multiple_files=True,
-        help="Supported formats: .txt, .pdf, .docx, .csv — upload related documents only",
+        help="Supported formats: .txt, .pdf, .docx, .doc, .csv, .xlsx",
     )
 
     if uploaded_files:
