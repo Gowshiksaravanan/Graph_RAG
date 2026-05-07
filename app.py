@@ -717,7 +717,7 @@ def _run_kg_tab():
         "Upload Documents",
         type=ACCEPTED_FILE_TYPES,
         accept_multiple_files=True,
-        help="Supported formats: .txt, .pdf, .docx — upload related documents only",
+        help="Supported formats: .txt, .pdf, .docx, .csv — upload related documents only",
     )
 
     if uploaded_files:
