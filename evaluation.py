@@ -59,18 +59,22 @@ def _parse_context_items(result: dict) -> tuple[list[str], list[dict]]:
 
 
 def generate_testset(texts: list[str], model: str = "gpt-4o", testset_size: int = 10) -> pd.DataFrame:
-    import os
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-    llm = LangchainLLMWrapper(ChatOpenAI(model=model, openai_api_key=OPENAI_API_KEY))
-    embeddings = LangchainEmbeddingsWrapper(LCOpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=OPENAI_API_KEY))
-
     lc_docs = [
         LCDocument(page_content=t, metadata={"source": f"doc_{i}"})
         for i, t in enumerate(texts)
     ]
 
-    generator = TestsetGenerator(llm=llm, embedding_model=embeddings)
-    dataset = _run_in_thread(generator.generate_with_langchain_docs, lc_docs, testset_size=testset_size)
+    def _generate():
+        import os
+        os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+        llm = LangchainLLMWrapper(ChatOpenAI(model=model, openai_api_key=OPENAI_API_KEY))
+        embeddings = LangchainEmbeddingsWrapper(
+            LCOpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=OPENAI_API_KEY)
+        )
+        generator = TestsetGenerator(llm=llm, embedding_model=embeddings)
+        return generator.generate_with_langchain_docs(lc_docs, testset_size=testset_size)
+
+    dataset = _run_in_thread(_generate)
     df = dataset.to_pandas()
 
     logger.info(f"RAGAS testset columns: {list(df.columns)}")
@@ -140,16 +144,18 @@ def run_evaluation(
         })
 
     dataset = EvaluationDataset.from_list(eval_data)
-    import os
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-    evaluator_llm = LangchainLLMWrapper(ChatOpenAI(model=model, openai_api_key=OPENAI_API_KEY))
 
-    ragas_results = _run_in_thread(
-        evaluate,
-        dataset=dataset,
-        metrics=[Faithfulness(), AnswerRelevancy(), ContextPrecision(), ContextRecall()],
-        llm=evaluator_llm,
-    )
+    def _evaluate():
+        import os
+        os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+        evaluator_llm = LangchainLLMWrapper(ChatOpenAI(model=model, openai_api_key=OPENAI_API_KEY))
+        return evaluate(
+            dataset=dataset,
+            metrics=[Faithfulness(), AnswerRelevancy(), ContextPrecision(), ContextRecall()],
+            llm=evaluator_llm,
+        )
+
+    ragas_results = _run_in_thread(_evaluate)
 
     ragas_df = ragas_results.to_pandas()
 
