@@ -49,22 +49,43 @@ def _parse_context_items(result: dict) -> tuple[list[str], list[dict]]:
 
 
 def generate_testset(texts: list[str], model: str = "gpt-4o", testset_size: int = 10) -> pd.DataFrame:
+    MAX_CHARS_PER_DOC = 50_000
     lc_docs = [
-        LCDocument(page_content=t, metadata={"source": f"doc_{i}"})
+        LCDocument(page_content=t[:MAX_CHARS_PER_DOC], metadata={"source": f"doc_{i}"})
         for i, t in enumerate(texts)
     ]
 
     def _generate():
         import os
         os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-        llm = LangchainLLMWrapper(ChatOpenAI(model=model, openai_api_key=OPENAI_API_KEY))
+        llm = LangchainLLMWrapper(ChatOpenAI(
+            model=model,
+            openai_api_key=OPENAI_API_KEY,
+            timeout=120,
+            max_retries=3,
+        ))
         embeddings = LangchainEmbeddingsWrapper(
-            LCOpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=OPENAI_API_KEY)
+            LCOpenAIEmbeddings(
+                model="text-embedding-3-small",
+                openai_api_key=OPENAI_API_KEY,
+                timeout=60,
+                max_retries=3,
+            )
         )
         generator = TestsetGenerator(llm=llm, embedding_model=embeddings)
         return generator.generate_with_langchain_docs(lc_docs, testset_size=testset_size)
 
-    dataset = _run_in_thread(_generate)
+    for attempt in range(3):
+        try:
+            dataset = _run_in_thread(_generate)
+            break
+        except Exception as e:
+            if attempt < 2:
+                wait = 10 * (attempt + 1)
+                logger.warning(f"Testset generation attempt {attempt+1} failed ({e}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
     df = dataset.to_pandas()
 
     logger.info(f"RAGAS testset columns: {list(df.columns)}")
