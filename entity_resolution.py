@@ -100,8 +100,12 @@ def score_embedding_batch(pairs: list[dict]) -> list[dict]:
 
     all_texts = texts_a + texts_b
     try:
-        response = client.embeddings.create(model=EMBEDDING_MODEL, input=all_texts)
-        embeddings = [np.array(item.embedding) for item in response.data]
+        embeddings = []
+        batch_size = 2048
+        for start in range(0, len(all_texts), batch_size):
+            batch = all_texts[start:start + batch_size]
+            response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+            embeddings.extend(np.array(item.embedding) for item in response.data)
     except Exception as e:
         logger.error(f"Embedding API error: {e}")
         return [{**p, "score_type": "embedding", "score": -1,
