@@ -1035,7 +1035,7 @@ def query_graph_rag(
     llm = OpenAILLM(
         api_key=OPENAI_API_KEY,
         model_name=model,
-        model_params={"temperature": 0.1, "max_tokens": 1000},
+        model_params={"temperature": 0.1, "max_tokens": 1500},
     )
 
     prompt = RagTemplate(
@@ -1054,7 +1054,8 @@ Answer:
             "Answer the user question using ONLY the provided context. "
             "Do not add information that is not explicitly stated in the context. "
             "If the context does not contain enough information, say so. "
-            "Be concise and specific — prefer short, factual answers over long explanations."
+            "Provide a thorough answer that fully addresses the question, "
+            "including relevant details, names, and specifics from the context."
         ),
     )
 
