@@ -1,3 +1,4 @@
+import time
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
@@ -93,30 +94,40 @@ def run_evaluation(
         raise ValueError("No knowledge graph found. Build one first.")
 
     rows = []
-    for _, row in qa_pairs.iterrows():
+    for idx, row in qa_pairs.iterrows():
+        if len(rows) > 0:
+            time.sleep(1)
         question = str(row["question"])
         ground_truth = str(row["ground_truth"])
 
-        try:
-            result = query_graph_rag(
-                driver, question, model,
-                hops=max_hops,
-                weight_threshold=0.1,
-                confidence_threshold=0.0,
-            )
-            answer = result["answer"]
-            contexts, raw_items = _parse_context_items(result)
-            hops_used = result.get("hops_used", 0)
-            if hops_used == 0:
-                hops_used = measure_answer_hops(
-                    driver, question, answer, max_hops=max_hops,
+        answer = None
+        for attempt in range(3):
+            try:
+                result = query_graph_rag(
+                    driver, question, model,
+                    hops=max_hops,
+                    weight_threshold=0.1,
+                    confidence_threshold=0.0,
                 )
-            logger.info(f"Q: {question[:80]}... → hops_used={hops_used}")
-        except Exception as e:
-            logger.error(f"Query failed for: {question} — {e}")
-            answer = f"Error: {e}"
-            contexts = []
-            hops_used = 0
+                answer = result["answer"]
+                contexts, raw_items = _parse_context_items(result)
+                hops_used = result.get("hops_used", 0)
+                if hops_used == 0:
+                    hops_used = measure_answer_hops(
+                        driver, question, answer, max_hops=max_hops,
+                    )
+                logger.info(f"Q: {question[:80]}... → hops_used={hops_used}")
+                break
+            except Exception as e:
+                if attempt < 2:
+                    wait = 2 ** (attempt + 1)
+                    logger.warning(f"Query attempt {attempt+1} failed ({e}), retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    logger.error(f"Query failed after 3 attempts: {question} — {e}")
+                    answer = f"Error: {e}"
+                    contexts = []
+                    hops_used = 0
 
         rows.append({
             "question": question,
@@ -149,7 +160,18 @@ def run_evaluation(
             llm=evaluator_llm,
         )
 
-    ragas_results = _run_in_thread(_evaluate)
+    for attempt in range(3):
+        try:
+            ragas_results = _run_in_thread(_evaluate)
+            break
+        except Exception as e:
+            if attempt < 2:
+                wait = 5 * (attempt + 1)
+                logger.warning(f"RAGAS evaluation attempt {attempt+1} failed ({e}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                logger.error(f"RAGAS evaluation failed after 3 attempts: {e}")
+                raise
 
     ragas_df = ragas_results.to_pandas()
 
