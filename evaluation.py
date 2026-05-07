@@ -21,12 +21,10 @@ from graph import Neo4jClient, query_graph_rag, has_any_entities, measure_answer
 
 def _run_in_thread(fn, *args, **kwargs):
     import asyncio
-    import nest_asyncio
 
     def _target():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        nest_asyncio.apply(loop)
         return fn(*args, **kwargs)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -48,20 +46,40 @@ def _parse_context_items(result: dict) -> tuple[list[str], list[dict]]:
 
 
 def generate_testset(texts: list[str], model: str = "gpt-4o", testset_size: int = 10) -> pd.DataFrame:
+    import httpx
+
+    MAX_TOTAL_CHARS = 100_000
     MAX_CHARS_PER_DOC = 50_000
+
+    trimmed = [t[:MAX_CHARS_PER_DOC] for t in texts]
+    total = sum(len(t) for t in trimmed)
+    if total > MAX_TOTAL_CHARS:
+        ratio = MAX_TOTAL_CHARS / total
+        trimmed = [t[:int(len(t) * ratio)] for t in trimmed]
+
     lc_docs = [
-        LCDocument(page_content=t[:MAX_CHARS_PER_DOC], metadata={"source": f"doc_{i}"})
-        for i, t in enumerate(texts)
+        LCDocument(page_content=t, metadata={"source": f"doc_{i}"})
+        for i, t in enumerate(trimmed) if t.strip()
     ]
 
     def _generate():
         import os
         os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+        http_client = httpx.Client(
+            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
+            timeout=httpx.Timeout(120.0, connect=30.0),
+        )
+        async_http_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
+            timeout=httpx.Timeout(120.0, connect=30.0),
+        )
         llm = LangchainLLMWrapper(ChatOpenAI(
             model=model,
             openai_api_key=OPENAI_API_KEY,
             timeout=120,
             max_retries=3,
+            http_client=http_client,
+            http_async_client=async_http_client,
         ))
         embeddings = LangchainEmbeddingsWrapper(
             LCOpenAIEmbeddings(
